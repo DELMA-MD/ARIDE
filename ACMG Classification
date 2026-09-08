@@ -1,1 +1,17 @@
+PVS1 - Variant is not a loss-of-function type recognized by PVS1 — not evaluated
+VERY_STRONG - Likely Pathogenic - 8
+STRONG - VUS - 4
+MODERATE - VUS - 2
+SUPPORTING - VUS - 1
+
+PS1 - No same amino acid change has been reported as Pathogenic/Likely Pathogenic in ClinVar
+VERY_STRONG - Likely Pathogenic - 8
+STRONG - VUS - 4
+MODERATE - VUS - 2
+SUPPORTING - VUS - 1
+
+PS2 - Not evaluated — pedigree data required for de novo confirmation is not available.
+STRONG - VUS - 4
+MODERATE - VUS - 2
+SUPPORTING - VUS - 1
 
