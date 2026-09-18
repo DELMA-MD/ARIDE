@@ -1,17 +1,1352 @@
-PVS1 - Variant is not a loss-of-function type recognized by PVS1 — not evaluated
-VERY_STRONG - Likely Pathogenic - 8
-STRONG - VUS - 4
-MODERATE - VUS - 2
-SUPPORTING - VUS - 1
+from __future__ import annotations
+import re
+import time
+import requests
+import streamlit as st
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
 
-PS1 - No same amino acid change has been reported as Pathogenic/Likely Pathogenic in ClinVar
-VERY_STRONG - Likely Pathogenic - 8
-STRONG - VUS - 4
-MODERATE - VUS - 2
-SUPPORTING - VUS - 1
+ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
-PS2 - Not evaluated — pedigree data required for de novo confirmation is not available.
-STRONG - VUS - 4
-MODERATE - VUS - 2
-SUPPORTING - VUS - 1
+CLASS_COLORS = {
+    "pathogenic": "#b23b3b",
+    "likely pathogenic": "#c9645a",
+    "pathogenic/likely pathogenic": "#b23b3b",
+    "uncertain significance": "#c98a1a",
+    "vus": "#c98a1a",
+    "benign": "#2a7f4f",
+    "likely benign": "#4f9f6f",
+    "benign/likely benign": "#2a7f4f",
+    "conflicting classifications of pathogenicity": "#8a5fb2",
+}
 
+def extract_c_notation(title: str) -> str:
+    match = re.search(r":(c\.[^\s(]+)", title)
+    return match.group(1).strip() if match else ""
+
+def query_clinvar(gene: str, variant: str, retries: int = 3):
+    term = f'{gene}[gene] AND "{variant}"[Variant name]'
+    params = {"db": "clinvar", "term": term, "retmode": "json", "retmax": 20}
+
+    ids = []
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(ESEARCH_URL, params=params, timeout=15)
+            r.raise_for_status()
+            ids = r.json().get("esearchresult", {}).get("idlist", [])
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+    if last_err is not None:
+        raise last_err
+
+    if not ids:
+        params["term"] = f"{gene}[gene] AND {variant}"
+        r = requests.get(ESEARCH_URL, params=params, timeout=15)
+        r.raise_for_status()
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+
+    if not ids:
+        return []
+
+    sum_params = {"db": "clinvar", "id": ",".join(ids), "retmode": "json"}
+    r = requests.get(ESUMMARY_URL, params=sum_params, timeout=15)
+    r.raise_for_status()
+    result = r.json().get("result", {})
+
+    variant_clean = variant.strip().lower()
+    records = []
+    for uid in ids:
+        rec = result.get(uid)
+        if not rec:
+            continue
+        title = rec.get("title", "")
+
+        if extract_c_notation(title).lower() != variant_clean:
+            continue
+
+        germline = rec.get("germline_classification", {}) or {}
+        last_evaluated_raw = germline.get("last_evaluated", "")
+        last_evaluated_date = last_evaluated_raw.split(" ")[0] if last_evaluated_raw else ""
+        records.append(
+            {
+                "accession": rec.get("accession", uid),
+                "title": title,
+                "classification": germline.get("description", "Not provided"),
+                "last_evaluated": last_evaluated_date,
+                "link": f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{uid}/",
+            }
+        )
+    return records
+
+def badge(classification: str) -> str:
+    color = CLASS_COLORS.get(classification.strip().lower(), "#5a6675")
+    return (
+        f'<span style="background:{color};color:white;padding:2px 10px;'
+        f'border-radius:12px;font-size:0.85em;font-weight:600">{classification}</span>'
+    )
+
+def needs_reclassification(classification: str) -> bool:
+    c = classification.strip().lower()
+    is_settled = ("pathogenic" in c or "benign" in c) and "conflicting" not in c and "uncertain" not in c
+    return not is_settled
+
+st.set_page_config(page_title="VUS Reclassification", page_icon="\U0001F9EC", layout="centered")
+
+if "view" not in st.session_state:
+    st.session_state["view"] = "clinvar"
+
+# ClinVar check
+def render_clinvar_slide():
+    st.title("ClinVar Verification")
+    st.caption("Check the current ClinVar classification")
+
+    with st.form("intake_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            gene = st.text_input("Gene", placeholder="e.g. EYS")
+        with c2:
+            variant = st.text_input("HGVS variant (c. notation)", placeholder="e.g. c.9270_9271insA")
+        submitted = st.form_submit_button("Check in ClinVar")
+
+    if submitted:
+        if not gene.strip() or not variant.strip():
+            st.warning("Enter both gene symbol and variant.")
+        else:
+            with st.spinner(f"Verifying for {gene} {variant}... in ClinVar"):
+                try:
+                    results = query_clinvar(gene.strip(), variant.strip())
+                    error = None
+                except Exception as e:
+                    results, error = None, e
+
+            if error is not None:
+                st.error(f"ClinVar lookup failed: {error}")
+            elif not results:
+                st.info(
+                    f"No ClinVar record found for {gene} {variant}. "
+                    "Proceed to Reclassification"
+                )
+                st.session_state["start"] = {"gene": gene, "variant": variant, "status": "not_found"}
+                st.session_state.pop("reclass_variants", None)
+            else:
+                st.success(f"Found {len(results)} ClinVar record(s) for {gene} {variant}")
+                for rec in results:
+                    st.markdown(
+                        f"**{rec['title']}**  \n"
+                        f"{badge(rec['classification'])} &nbsp;\u00b7&nbsp; "
+                        f"Last evaluated: {rec['last_evaluated'] or '\u2014'}  \n"
+                        f"[View in ClinVar]({rec['link']}) &nbsp;\u00b7&nbsp; Accession: `{rec['accession']}`",
+                        unsafe_allow_html=True,
+                    )
+                    st.divider()
+
+                primary = results[0]["classification"].strip().lower()
+
+                if needs_reclassification(primary):
+                    if "conflicting" in primary:
+                        st.warning("Conflicting classifications in ClinVar. Proceed to Reclassification.")
+                    else:
+                        st.warning("Uncertain significance. Proceed to Reclassification.")
+                else:
+                    label = "Pathogenic" if "pathogenic" in primary else "Benign"
+                    st.success(
+                        f"Already classified as {label} based on current ClinVar evidence \u2014 "
+                        f"Reclassification is not needed."
+                    )
+
+                st.session_state["start"] = {
+                    "gene": gene,
+                    "variant": variant,
+                    "status": primary,
+                    "records": results,
+                }
+                st.session_state.pop("reclass_variants", None)
+
+    if "start" in st.session_state:
+        st.divider()
+        status = st.session_state["start"]["status"]
+        reclass_enabled = needs_reclassification(status)
+
+        if st.button("Reclassification \u2192", disabled=not reclass_enabled, use_container_width=True):
+            st.session_state["view"] = "reclass"
+            st.rerun()
+
+# Variant intake for reclassification
+def render_reclass_slide():
+    if st.button("\u2190 Back to ClinVar check"):
+        st.session_state["view"] = "clinvar"
+        st.rerun()
+
+    st.title("Variant Intake")
+    st.caption("Enter the variant details required for database/tool lookup")
+
+    prior = st.session_state.get("start", {})
+
+    with st.form("variant_form"):
+
+        col1, col2 = st.columns(2)
+        with col1:
+            gene_symbol = st.text_input("Gene symbol", value=prior.get("gene", ""), placeholder="ARL6")
+        with col2:
+            transcript_id = st.text_input("Transcript ID", placeholder="NM_177976.3")
+
+        col3, col4 = st.columns(2)
+        with col3:
+            chromosome = st.text_input("Chromosome", placeholder="3")
+        with col4:
+            position = st.text_input("Position (GRCh38)", placeholder="97784972")
+
+        col5, col6 = st.columns(2)
+        with col5:
+            ref_allele = st.text_input("Reference allele", placeholder="T")
+        with col6:
+            alt_allele = st.text_input("Alternate allele", placeholder="C")
+
+        col7, col8 = st.columns(2)
+        with col7:
+            hgvs_c = st.text_input("HGVS coding (c.)", value=prior.get("variant", ""), placeholder="c.272T>C")
+        with col8:
+            hgvs_p = st.text_input("HGVS protein (p.)", placeholder="p.Ile91Thr")
+
+        variant_submitted = st.form_submit_button("Submit variant")
+
+    if variant_submitted:
+        required = {
+            "Gene symbol": gene_symbol,
+            "Transcript ID": transcript_id,
+            "Chromosome": chromosome,
+            "Position": position,
+            "Reference allele": ref_allele,
+            "Alternate allele": alt_allele,
+            "HGVS coding (c.)": hgvs_c,
+            "HGVS protein (p.)": hgvs_p
+        }
+        missing = [name for name, val in required.items() if not val.strip()]
+
+        if missing:
+            st.error(f"Missing required field(s): {', '.join(missing)}")
+        else:
+            variant_record = {
+                "gene_symbol": gene_symbol.strip(),
+                "transcript_id": transcript_id.strip(),
+                "chromosome": chromosome.strip(),
+                "position": position.strip(),
+                "ref_allele": ref_allele.strip().upper(),
+                "alt_allele": alt_allele.strip().upper(),
+                "hgvs_c": hgvs_c.strip(),
+                "hgvs_p": hgvs_p.strip(),
+                "hgvs_genomic": f"chr{chromosome.strip()}:g.{position.strip()}{ref_allele.strip().upper()}>{alt_allele.strip().upper()}",
+            }
+
+            if "reclass_variants" not in st.session_state:
+                st.session_state.reclass_variants = []
+            st.session_state.reclass_variants.append(variant_record)
+if st.session_state["view"] == "clinvar":
+    render_clinvar_slide()
+else:
+    render_reclass_slide()
+
+class Strength(Enum):
+    VERY_STRONG = 8
+    STRONG = 4
+    MODERATE = 2
+    SUPPORTING = 1
+    STAND_ALONE = 8
+
+BENIGN_CODES = {"BA1", "BS1", "BS2", "BS3", "BS4", "BP1", "BP2", "BP3", "BP4", "BP5", "BP6", "BP7"}
+
+@dataclass
+class EvidenceLine:
+    code: str            
+    strength: Strength
+    step: str             
+    note: str = ""
+
+    @property
+    def points(self) -> int:
+        sign = -1 if self.code in BENIGN_CODES else 1
+        return sign * self.strength.value
+
+
+class MolecularClass(Enum):
+    TRUNCATING = "truncating"                 # nonsense / frameshift / canonical +/-1,2 splice
+    MISSENSE = "missense"
+    INFRAME_INDEL = "inframe_indel"
+    SPLICE_OR_SYNONYMOUS = "splice_or_synonymous"  # synonymous / deep-intronic / near-splice non-canonical
+
+
+class Inheritance(Enum):
+    AR = "autosomal_recessive"
+    AD = "autosomal_dominant"
+    XL = "x_linked"
+
+
+class GeneValidity(Enum):
+    DEFINITIVE = "definitive"
+    STRONG = "strong"
+    MODERATE = "moderate"
+    LIMITED = "limited"
+    DISPUTED = "disputed"
+    REFUTED = "refuted"
+    NO_KNOWN = "no_known_disease_relationship"
+
+
+class Zygosity(Enum):
+    HOM_AR = "homozygous_in_AR_gene"
+    COMP_HET_AR = "two_het_same_AR_gene"
+    SINGLE_HET_AR = "single_het_in_AR_gene"
+    HET_DOMINANT = "het_in_dominant_gene"
+    HEMI_XL_MALE = "hemizygous_x_linked_male"
+
+
+@dataclass
+class VariantCase:
+    variant_id: str
+    gene: str
+    inheritance: Inheritance
+    gene_validity: GeneValidity
+    molecular_class: MolecularClass
+
+    gnomad_popmax_faf: float = 0.0            # 0-1 fraction
+    max_credible_af_for_disease: float = 0.0001
+    healthy_homozygotes_observed: bool = False
+
+    # Step 3a — LoF / NMD
+    nmd_competent: Optional[bool] = None
+    established_lof_mechanism: bool = True
+    frame_preserving: bool = False
+
+    # Step 3b/3c — in-silico
+    revel_score: Optional[float] = None        # missense / in-frame indel
+    spliceai_delta: Optional[float] = None      # near-splice/synonymous/deep-intronic
+
+    # Step 4 — genotype
+    zygosity: Optional[Zygosity] = None
+
+    # Step 5a — ROH (consanguinity)
+    in_roh: Optional[bool] = None
+    roh_length_mb: float = 0.0
+
+    # Step 5b — phasing
+    parents_available: Optional[bool] = None
+    reads_shared_for_phasing: bool = False
+    phase_result: Optional[str] = None          # "trans" | "cis" | None
+
+    # Step 5c — second-allele hunt
+    cnv_found: Optional[bool] = None
+    cnv_is_null: bool = False
+    phenotype_strongly_matches_gene: bool = False
+    wgs_deep_intronic_found: Optional[bool] = None
+    complex_sv_locus: bool = False              # e.g. RPGR-ORF15 / repeat region
+    long_read_resolved: Optional[bool] = None
+
+    # Step 5d — segregation / de novo
+    segregates_with_disease: Optional[bool] = None
+    informative_meioses: int = 0
+    apparent_de_novo: Optional[bool] = None
+    de_novo_confirmed: Optional[bool] = None
+
+    # Step 6 — functional
+    functional_assay_available: bool = False
+    functional_assay_result: Optional[str] = None   # "pathogenic" | "benign" | "indeterminate"
+
+    # Step 8 — scheduled reanalysis
+    months_since_last_run: int = 0
+
+
+@dataclass
+class PipelineResult:
+    variant_id: str
+    classification: str = "VUS"
+    terminal: str = ""
+    evidence: list[EvidenceLine] = field(default_factory=list)
+    trail: list[str] = field(default_factory=list)
+    next_action: str = ""
+
+    @property
+    def total_points(self) -> int:
+        return sum(e.points for e in self.evidence)
+
+    def add(self, code: str, strength: Strength, step: str, note: str = "") -> None:
+        self.evidence.append(EvidenceLine(code, strength, step, note))
+
+    def log(self, msg: str) -> None:
+        self.trail.append(msg)
+
+    def finish(self, classification: str, terminal: str, next_action: str = "") -> "PipelineResult":
+        self.classification = classification
+        self.terminal = terminal
+        self.next_action = next_action
+        return self
+
+    def report(self) -> str:
+        has_standalone = any(e.strength == Strength.STAND_ALONE for e in self.evidence)
+        points_str = "stand-alone" if has_standalone else f"{self.total_points:+d}"
+        lines = [
+            f"Variant: {self.variant_id}",
+            f"Final classification: {self.classification}  (points: {points_str})",
+            f"Terminal: {self.terminal}",
+        ]
+        if self.evidence:
+            lines.append("Evidence accumulated:")
+            for e in self.evidence:
+                lines.append(f"  - {e.code} ({e.strength.name}, {e.points:+d} pts) @ {e.step}"
+                             + (f" \u2014 {e.note}" if e.note else ""))
+        lines.append("Decision trail:")
+        for i, step in enumerate(self.trail, 1):
+            lines.append(f"  {i}. {step}")
+        if self.next_action:
+            lines.append(f"Next action: {self.next_action}")
+        return "\n".join(lines)
+
+
+class VUSResolutionPipeline:
+
+    def run(self, case: VariantCase) -> PipelineResult:
+        result = PipelineResult(variant_id=case.variant_id)
+        result.log("START: VUS after baseline ACMG re-scoring -> Step 1 (re-annotate)")
+        return self.step1_reannotate(case, result)
+
+    # ---- STEP 1 — re-annotate (free, computational) ---------------------- #
+    def step1_reannotate(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 1: pull gnomAD v4 popmax FAF, REVEL/AlphaMissense, SpliceAI, ClinGen gene validity")
+
+        if case.gnomad_popmax_faf > max(case.max_credible_af_for_disease, 0.05):
+            r.add("BA1", Strength.STAND_ALONE, "Step1", "popmax FAF exceeds max credible AF / 5%")
+            r.log("popmax FAF too high -> BA1/BS1, downgrade toward Benign")
+            return r.finish("Benign / Likely Benign", "Downgraded", "Remove from candidate list")
+
+        if case.healthy_homozygotes_observed and case.inheritance == Inheritance.AR:
+            r.add("BS2", Strength.STRONG, "Step1", "healthy homozygotes in population-matched reference")
+            r.log("Healthy homozygotes observed for high-penetrance AR gene -> BS2, downgrade")
+            return r.finish("Likely Benign", "Downgraded", "Remove from candidate list")
+
+        if case.gene_validity in (GeneValidity.DISPUTED, GeneValidity.REFUTED, GeneValidity.NO_KNOWN):
+            r.log(f"Gene-disease validity is {case.gene_validity.value} -> cap at VUS regardless of variant evidence")
+            return r.finish("VUS", "Parked (gene validity)",
+                             "Park pending ClinGen gene-disease re-curation")
+
+        r.log("Still uncertain after re-annotation -> Step 2 (molecular-class triage)")
+        return self.step2_class_triage(case, r)
+
+    # ---- STEP 2 — triage by molecular class ------------------------------ #
+    def step2_class_triage(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log(f"STEP 2: molecular class = {case.molecular_class.value}")
+        if case.molecular_class == MolecularClass.TRUNCATING:
+            return self.step3a_lof(case, r)
+        if case.molecular_class == MolecularClass.MISSENSE:
+            return self.step3b_missense(case, r)
+        if case.molecular_class == MolecularClass.INFRAME_INDEL:
+            r.add("PM4", Strength.MODERATE, "Step2", "in-frame indel")
+            r.log("In-frame indel -> PM4, also evaluate as missense (REVEL) if available")
+            return self.step3b_missense(case, r)
+        # synonymous / deep-intronic / near-splice
+        return self.step3c_splice(case, r)
+
+    # ---- STEP 3a — LoF: PVS1 via NMD decision -------------------------- #
+    def step3a_lof(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 3a: grade PVS1 via NMD decision tree (Abou-Tayoun 2018)")
+        if case.nmd_competent and case.established_lof_mechanism and not case.frame_preserving:
+            r.add("PVS1", Strength.VERY_STRONG, "Step3a", "NMD-competent exon, established LoF mechanism")
+            r.log("NMD-competent, established LoF -> PVS1 Very Strong (usually LP alone)")
+        else:
+            strength = Strength.MODERATE if case.frame_preserving else Strength.STRONG
+            r.add("PVS1", strength, "Step3a", "NMD-escape (last exon/penultimate last-50bp) or frame-preserving")
+            r.log(f"NMD-escape or frame-preserving -> PVS1 downgraded to {strength.name}; needs 2nd line")
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 3b — missense / in-frame: calibrated in-silico ------------ #
+    def step3b_missense(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 3b: calibrated REVEL/AlphaMissense (Pejaver 2022) — one line, capped strength")
+        revel = case.revel_score
+        if revel is None:
+            r.log("No REVEL score available -> no in-silico code; rely on genotype/functional")
+        elif revel >= 0.932:
+            r.add("PP3", Strength.STRONG, "Step3b", f"REVEL={revel:.3f} >= 0.932")
+        elif revel >= 0.773:
+            r.add("PP3", Strength.MODERATE, "Step3b", f"REVEL={revel:.3f} in [0.773, 0.932)")
+        elif revel >= 0.644:
+            r.add("PP3", Strength.SUPPORTING, "Step3b", f"REVEL={revel:.3f} in [0.644, 0.773)")
+        elif revel <= 0.016:
+            r.add("BP4", Strength.STRONG, "Step3b", f"REVEL={revel:.3f} <= 0.016")
+        elif revel <= 0.183:
+            r.add("BP4", Strength.MODERATE, "Step3b", f"REVEL={revel:.3f} in (0.183, 0.290]")
+        elif revel <= 0.290:
+            r.add("BP4", Strength.SUPPORTING, "Step3b", f"REVEL={revel:.3f} in (0.183, 0.290]")
+        else:
+            r.log(f"REVEL={revel:.3f} in indeterminate band (0.290-0.644) -> no in-silico code")
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 3c — near-splice/synonymous/deep-intronic: SpliceAI ------- #
+    def step3c_splice(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 3c: SpliceAI prediction (Jaganathan 2019) — prediction only, not evidence")
+        delta = case.spliceai_delta
+        if delta is not None and delta >= 0.5:
+            r.add("PP3", Strength.SUPPORTING, "Step3c", f"SpliceAI delta={delta:.2f} >= 0.5")
+            r.log("SpliceAI \u0394>=0.5 -> PP3 supporting now; trigger RNA/minigene assay -> Step 6 functional")
+            return self.step6_functional(case, r)
+        if delta is not None and delta < 0.2:
+            r.add("BP4", Strength.SUPPORTING, "Step3c", f"SpliceAI delta={delta:.2f} < 0.2")
+            r.log("SpliceAI \u0394<0.2 -> BP4/BP7 supporting benign")
+        else:
+            r.log("SpliceAI in indeterminate band (0.2-0.5) or unavailable")
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 4 — triage by genotype / zygosity ------------------------- #
+    def step4_genotype(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log(f"STEP 4: genotype triage \u2014 zygosity = {case.zygosity.value if case.zygosity else 'unspecified'}")
+        z = case.zygosity
+        if z == Zygosity.HOM_AR:
+            return self.step5a_roh(case, r)
+        if z == Zygosity.COMP_HET_AR:
+            return self.step5b_phase(case, r)
+        if z == Zygosity.SINGLE_HET_AR:
+            return self.step5c_second_allele(case, r)
+        if z in (Zygosity.HET_DOMINANT, Zygosity.HEMI_XL_MALE):
+            return self.step5d_segregation(case, r)
+        r.log("Zygosity unspecified -> cannot route further; parking")
+        return r.finish("VUS", "Parked (genotype unresolved)", "Confirm zygosity / genotype and re-run Step 4")
+
+    # ---- STEP 5a — ROH / autozygosity mapping --------------------------- #
+    def step5a_roh(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5a: ROH / autozygosity mapping (AutoMap; Quinodoz 2021)")
+        if case.in_roh and case.roh_length_mb >= 1.5:
+            r.log(f"Homozygous VUS in ROH ({case.roh_length_mb:.2f} Mb >= 1.5 Mb) -> locus prioritised")
+            r.log("Frames PP1/BS4 -> proceed to segregation + functional")
+            return self.step5d_segregation(case, r)
+        r.log("VUS NOT in ROH (unexpected for consanguineous case) -> flag possible CNV masking het; "
+              "reconsider as second-allele hunt")
+        return self.step5c_second_allele(case, r)
+
+    # ---- STEP 5b — phasing (compound-het trans confirmation) ------------ #
+    def step5b_phase(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5b: phasing (PM3 requires trans configuration)")
+        if case.phase_result == "cis":
+            r.add("BP2", Strength.SUPPORTING, "Step5b", "variants confirmed in cis")
+            r.log("Variants in cis -> reject biallelic hypothesis, apply BP2; look elsewhere")
+            return self.step5c_second_allele(case, r)
+
+        if case.parents_available:
+            r.log("Parents available -> trio-phase")
+        elif case.reads_shared_for_phasing:
+            r.log("Parents unavailable, variants share reads -> read-backed phasing (WhatsHap)")
+        else:
+            r.log("Cannot phase (no parents, no shared reads) -> park pending phasing data")
+            return r.finish("VUS", "Parked (unphased compound-het)",
+                             "Obtain parental samples or long-read/read-backed phasing")
+
+        if case.phase_result == "trans":
+            r.add("PM3", Strength.MODERATE, "Step5b", "confirmed trans configuration")
+            r.log("Confirmed trans -> PM3 (supporting->strong by points)")
+            return self.step6_functional(case, r)
+
+        r.log("Phase result not yet confirmed -> park pending phasing outcome")
+        return r.finish("VUS", "Parked (phasing pending)", "Complete trio or read-backed phasing")
+
+    # ---- STEP 5c — second-allele hunt ------------------------------------ #
+    def step5c_second_allele(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5c: second-allele hunt (single het in AR gene \u2014 escalate cheapest-first)")
+
+        if case.cnv_found:
+            code, strength = ("PVS1", Strength.VERY_STRONG) if case.cnv_is_null else ("PM3", Strength.MODERATE)
+            r.add(code, strength, "Step5c", "exon-level CNV found via read-depth (ExomeDepth), orthogonally confirmed")
+            r.log("Exon-level deletion found -> 2nd allele identified; proceed to confirm trans")
+            return self.step5b_phase(case, r)
+
+        if case.wgs_deep_intronic_found:
+            r.add("PP3", Strength.SUPPORTING, "Step5c", "WGS deep-intronic/structural allele found")
+            r.log("CNV-negative + strong phenotype match -> WGS found deep-intronic/structural allele "
+                  "-> trigger functional confirmation (RNA)")
+            return self.step6_functional(case, r)
+
+        if case.complex_sv_locus:
+            if case.long_read_resolved:
+                r.add("PM3", Strength.MODERATE, "Step5c", "breakpoints and phase resolved by long-read sequencing")
+                r.log("RPGR-ORF15/repeat/complex SV resolved by long-read sequencing -> phase established")
+                return self.step6_functional(case, r)
+            r.log("Complex SV locus (e.g. RPGR-ORF15) not yet resolved -> long-read sequencing pending")
+            return r.finish("VUS", "Parked (complex SV pending long-read)",
+                             "Order long-read sequencing / dedicated SV resolution")
+
+        if case.phenotype_strongly_matches_gene and case.wgs_deep_intronic_found is None:
+            r.log("CNV-negative, strong phenotype match, WGS not yet done -> escalate to WGS")
+            return r.finish("VUS", "Parked (awaiting WGS)",
+                             "WGS for deep-intronic/structural alleles (e.g. ABCA4/USH2A)")
+
+        r.log("All second-allele avenues negative -> park for scheduled reanalysis")
+        return self.step8_scheduled_reanalysis(case, r, from_step="Step5c")
+
+    # ---- STEP 5d — segregation & de novo ---------------------------------- #
+    def step5d_segregation(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5d: segregation & de novo analysis")
+
+        if case.apparent_de_novo:
+            if case.de_novo_confirmed:
+                r.add("PS2", Strength.STRONG, "Step5d", "de novo confirmed by parentage testing")
+                r.log("Apparently de novo, parentage confirmed -> PS2")
+            else:
+                r.add("PM6", Strength.MODERATE, "Step5d", "de novo unconfirmed")
+                r.log("Apparently de novo, parentage unconfirmed -> PM6")
+            return self.step6_functional(case, r)
+
+        if case.segregates_with_disease is True:
+            strength = Strength.STRONG if case.informative_meioses >= 4 else Strength.SUPPORTING
+            r.add("PP1", strength, "Step5d", f"tracks across {case.informative_meioses} informative meioses")
+            r.log(f"Tracks with disease ({case.informative_meioses} meioses) -> PP1 {strength.name}")
+            return self.step6_functional(case, r)
+
+        if case.segregates_with_disease is False:
+            r.add("BS4", Strength.STRONG, "Step5d", "present in unaffected relative / fails to track")
+            r.log("Fails to track / present in unaffected -> BS4, downgrade")
+            return r.finish("Likely Benign", "Downgraded", "Remove from candidate list")
+
+        r.log("No segregation/de novo data yet -> proceed to functional evidence with existing evidence")
+        return self.step6_functional(case, r)
+
+    # ---- STEP 6 — functional / RNA evidence -------------------------------- #
+    def step6_functional(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 6: functional/RNA evidence (converts prediction -> PS3-level evidence)")
+
+        splice_like = case.molecular_class == MolecularClass.SPLICE_OR_SYNONYMOUS
+        if splice_like and case.functional_assay_available:
+            if case.functional_assay_result == "pathogenic":
+                r.add("PS3", Strength.STRONG, "Step6", "minigene/RNA-seq confirms aberrant splicing")
+                r.log("RNA assay confirms aberrant transcript -> PS3 Strong")
+            elif case.functional_assay_result == "benign":
+                r.add("BS3", Strength.STRONG, "Step6", "minigene/RNA-seq shows normal splicing")
+                r.log("RNA assay shows normal splicing -> BS3 Strong")
+            else:
+                r.log("RNA assay indeterminate -> no PS3/BS3 code assigned")
+        elif case.molecular_class in (MolecularClass.MISSENSE, MolecularClass.INFRAME_INDEL) \
+                and case.functional_assay_available:
+            if case.functional_assay_result == "pathogenic":
+                r.add("PS3", Strength.STRONG, "Step6", "validated gene-specific functional assay (OddsPath-scaled)")
+                r.log("Validated functional assay -> PS3 (OddsPath-scaled)")
+            elif case.functional_assay_result == "benign":
+                r.add("BS3", Strength.STRONG, "Step6", "validated gene-specific functional assay (OddsPath-scaled)")
+                r.log("Validated functional assay -> BS3 (OddsPath-scaled)")
+            else:
+                r.log("Functional assay indeterminate -> no PS3/BS3 code assigned")
+        else:
+            r.log("No assay available -> proceed to recombine with existing evidence")
+
+        return self.step7_recombine(case, r)
+
+    # ---- STEP 7 — recombine (Tavtigian points) and re-classify ------------ #
+    def step7_recombine(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        total = r.total_points
+        r.log(f"STEP 7: recombine Tavtigian points -> total = {total:+d} "
+              "(Supporting=1 / Moderate=2 / Strong=4 / Very Strong=8)")
+
+        if total >= 10:
+            return r.finish("Pathogenic", "Solved / upgraded", "Report")
+        if 6 <= total <= 9:
+            return r.finish("Likely Pathogenic", "Solved / upgraded",
+                             "Report (with genotype-completeness caveat)")
+        if total <= -1:
+            return r.finish("Likely Benign / Benign", "Downgraded", "Remove from candidate list")
+
+        # 0-5 points, still VUS
+        return self.step8_scheduled_reanalysis(case, r, from_step="Step7")
+
+    # ---- STEP 8 — scheduled reanalysis (the loop) -------------------------- #
+    def step8_scheduled_reanalysis(self, case: VariantCase, r: PipelineResult, from_step: str) -> PipelineResult:
+        r.log(f"STEP 8: still VUS (0-5 pts) at {from_step} -> park for scheduled reanalysis "
+              "(>=12-month re-run yields ~10-15% additional diagnoses/cycle)")
+        if case.months_since_last_run >= 12:
+            r.log(">=12 months elapsed -> re-run pipeline from Step 1")
+            return self.step1_reannotate(case, r)
+        return r.finish("VUS", "Parked (scheduled reanalysis)",
+                         f"Re-run from Step 1 in {max(0, 12 - case.months_since_last_run)} month(s), "
+                         "or sooner if ClinVar/gnomAD/ClinGen updates")
+
+
+# =====================================================================
+# STEP 4a (NEW) — Shared ACMG criteria table helpers
+#
+# Both the automated annotation-based call and the pipeline's evidence
+# trail are displayed as a table: criterion code, plain-language
+# description, strength/points, with a total-points row at the end.
+# =====================================================================
+
+ACMG_CRITERIA_DESCRIPTIONS = {
+    "PVS1": "Null variant in a gene where loss-of-function is a known disease mechanism",
+    "PS1": "Same amino-acid change as an established pathogenic variant",
+    "PS2": "De novo (confirmed) in a patient with the disease, no family history",
+    "PS3": "Well-established functional studies show a damaging effect",
+    "PS4": "Variant prevalence significantly increased in affected vs. controls",
+    "PM1": "Located in a mutational hot spot / functional domain",
+    "PM2": "Absent or at extremely low frequency in population databases",
+    "PM3": "In trans with a pathogenic variant (recessive disorders)",
+    "PM4": "Protein length change (in-frame indel / stop-loss)",
+    "PM5": "Novel missense change at a residue with a known pathogenic missense change",
+    "PM6": "Assumed de novo without confirmed parentage",
+    "PP1": "Cosegregates with disease in multiple affected family members",
+    "PP2": "Missense variant in a gene with a low rate of benign missense variation",
+    "PP3": "Multiple computational lines of evidence support a deleterious effect",
+    "PP4": "Phenotype highly specific for a disease with a single genetic aetiology",
+    "PP5": "Reputable source reports pathogenic, evidence unavailable",
+    "BA1": "Allele frequency too high to be causal (stand-alone benign)",
+    "BS1": "Allele frequency greater than expected for the disorder",
+    "BS2": "Observed in healthy individuals for a fully penetrant condition",
+    "BS3": "Well-established functional studies show no damaging effect",
+    "BS4": "Lack of segregation in affected family members",
+    "BP1": "Missense variant in a gene where only truncating variants cause disease",
+    "BP2": "Observed in trans/cis with a pathogenic variant",
+    "BP3": "In-frame indel in a repetitive region without known function",
+    "BP4": "Multiple computational lines of evidence suggest no impact",
+    "BP5": "Found in a case with an alternate molecular basis for disease",
+    "BP6": "Reputable source reports benign, evidence unavailable",
+    "BP7": "Synonymous variant with no predicted splice impact",
+}
+
+ACMG_CRITERIA_BASIS = {
+    "PVS1": "predicted loss-of-function effect",
+    "PS1": "known pathogenic variant at the same amino-acid change",
+    "PS2": "confirmed de novo occurrence",
+    "PS3": "functional assay",
+    "PS4": "case/control prevalence",
+    "PM1": "mutational hot-spot / functional domain location",
+    "PM2": "population frequency (gnomAD via dbNSFP)",
+    "PM3": "phase (trans) with a known pathogenic variant",
+    "PM4": "protein length change",
+    "PM5": "known pathogenic missense change at the same residue",
+    "PM6": "assumed (unconfirmed) de novo occurrence",
+    "PP1": "family segregation analysis",
+    "PP2": "gene-level missense constraint",
+    "PP3": "in-silico predictors (REVEL / AlphaMissense / CADD, via dbNSFP)",
+    "PP4": "phenotype specificity",
+    "PP5": "reputable source (e.g. ClinVar) report",
+    "BA1": "population frequency (gnomAD via dbNSFP)",
+    "BS1": "population frequency (gnomAD via dbNSFP)",
+    "BS2": "gnomAD homozygote count in unaffected individuals (via dbNSFP)",
+    "BS3": "functional assay",
+    "BS4": "family segregation analysis",
+    "BP1": "gene-level mechanism (truncating-only gene)",
+    "BP2": "phase (trans/cis) with a known pathogenic variant",
+    "BP3": "repetitive region location",
+    "BP4": "in-silico predictors (REVEL / AlphaMissense / CADD, via dbNSFP)",
+    "BP5": "alternate molecular diagnosis in the case",
+    "BP6": "reputable source (e.g. ClinVar) report",
+    "BP7": "splice-impact predictor (dbscSNV ADA/RF, via dbNSFP)",
+}
+
+STRENGTH_POINTS = {"VeryStrong": 8, "Strong": 4, "Moderate": 2, "Supporting": 1}
+DEFAULT_STRENGTH_BY_PREFIX = {
+    "PVS": "VeryStrong",
+    "PS": "Strong",
+    "PM": "Moderate",
+    "PP": "Supporting",
+    "BS": "Strong",
+    "BP": "Supporting",
+}
+
+
+def classify_from_points(total: int) -> str:
+    """Maps a total Tavtigian point score onto an ACMG/AMP classification
+    label, using the same thresholds as the pipeline's Step 7 recombine
+    (>=10 Pathogenic, 6-9 Likely Pathogenic, 0-5 VUS, <=-1 Likely Benign/
+    Benign)."""
+    if total >= 10:
+        return "Pathogenic"
+    if 6 <= total <= 9:
+        return "Likely Pathogenic"
+    if total <= -1:
+        return "Likely Benign / Benign"
+    return "Uncertain Significance"
+
+
+def pipeline_evidence_table(result: "PipelineResult"):
+    """Turns a PipelineResult's evidence list into table rows of
+    Criterion / Description / Strength / Points, plus a display-ready
+    total (handling the BA1 stand-alone short-circuit the same way
+    PipelineResult.report() does)."""
+    rows = []
+    for e in result.evidence:
+        points_display = "Stand-alone" if e.strength == Strength.STAND_ALONE else f"{e.points:+d}"
+        rows.append(
+            {
+                "Criterion": e.code,
+                "Description": ACMG_CRITERIA_DESCRIPTIONS.get(e.code, "\u2014"),
+                "Strength": e.strength.name,
+                "Points": points_display,
+            }
+        )
+    has_standalone = any(e.strength == Strength.STAND_ALONE for e in result.evidence)
+    total_display = "Stand-alone" if has_standalone else f"{result.total_points:+d}"
+    return rows, total_display
+
+
+# =====================================================================
+# STEP 5 (REPLACED) — dbNSFP annotation, via MyVariant.info
+#
+# The dbNSFP project's own public browser (https://query.dbnsfp.org) has
+# no documented/public REST API — it's a single-page app, its backend
+# route disallows automated fetching (robots.txt), and it isn't on this
+# environment's outbound network allowlist either. MyVariant.info is
+# used instead: it's a stable, documented, free, no-auth REST API that
+# aggregates and re-publishes the SAME dbNSFP release (functional
+# predictors, conservation scores, gnomAD-derived frequencies) alongside
+# dbSNP and ClinVar for the same variant, indexed on both hg19 and hg38.
+# Reference: https://docs.myvariant.info/
+#
+# IMPORTANT — this integration could not be exercised against a live
+# response in this environment (myvariant.info is also outside the
+# sandbox's outbound allowlist), so field paths below are taken from
+# MyVariant.info's published schema/docs rather than a verified live
+# call. The raw JSON is always shown in an expander in the UI below so
+# you can check/adjust field names quickly against what actually comes
+# back the first time you run this.
+#
+# Like the previous annotation source, this only ever receives a bare
+# chr-pos-ref-alt, so it can supply exactly the Step-1/Step-2/Step-3
+# evidence (population frequency, REVEL, AlphaMissense, CADD, splice
+# predictors) — never zygosity, phasing, family or functional-assay
+# data, which are collected from the user separately.
+# =====================================================================
+
+MYVARIANT_URL_TMPL = "https://myvariant.info/v1/variant/{hgvs}"
+MYVARIANT_FIELDS = (
+    "dbnsfp,dbsnp,clinvar,gnomad_exome,gnomad_genome,exac,"
+    "cadd,dbscsnv,vcf"
+)
+
+DBNSFP_TRUNCATING_EFFECTS = {
+    "stop_gained", "stop gained", "frameshift_variant", "frameshift variant",
+    "splice_donor_variant", "splice donor variant",
+    "splice_acceptor_variant", "splice acceptor variant", "start_lost", "start lost",
+}
+DBNSFP_INFRAME_EFFECTS = {
+    "inframe_deletion", "inframe deletion", "inframe_insertion", "inframe insertion",
+    "stop_lost", "stop lost",
+}
+DBNSFP_MISSENSE_EFFECTS = {"missense_variant", "missense variant", "nonsynonymous snv"}
+
+
+def build_genomic_hgvs(chrom: str, pos: str, ref: str, alt: str) -> str:
+    """chr3, 97784972, T, C -> 'chr3:g.97784972T>C' (MyVariant.info's
+    HGVS-genomic variant id format)."""
+    c = chrom.strip().replace("chr", "")
+    return f"chr{c}:g.{pos.strip()}{ref.strip().upper()}>{alt.strip().upper()}"
+
+
+def _first_present(d: dict, *paths, default=None):
+    """Walks a list of dotted paths (e.g. 'dbnsfp.gnomad4.af_total') against
+    nested dict d and returns the first non-None value found. Defensive
+    helper since exact field names/nesting can shift between dbNSFP/
+    MyVariant.info releases — see module docstring above."""
+    for path in paths:
+        node = d
+        ok = True
+        for key in path.split("."):
+            if isinstance(node, list):
+                node = node[0] if node else None
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+            else:
+                ok = False
+                break
+        if ok and node is not None:
+            return node
+    return default
+
+
+def _flatten_values(val):
+    """dbNSFP predictor scores/predictions are reported per-transcript,
+    so MyVariant.info often returns a list (sometimes nested) instead of
+    a single value when a variant maps to multiple transcripts. Flattens
+    that into a clean list, dropping Nones."""
+    if val is None:
+        return []
+    if not isinstance(val, list):
+        return [val]
+    flat = []
+    for v in val:
+        flat.extend(_flatten_values(v))
+    return flat
+
+
+def _worst_case_score(val, higher_is_more_damaging: bool = True) -> Optional[float]:
+    """Reduces a scalar-or-list dbNSFP score to one float, taking the
+    worst-case (most damaging) value across transcripts when there are
+    several \u2014 the standard convention for these predictors. Pass
+    higher_is_more_damaging=False for SIFT, which is inverted (lower
+    score = more damaging)."""
+    nums = []
+    for v in _flatten_values(val):
+        try:
+            nums.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if not nums:
+        return None
+    return max(nums) if higher_is_more_damaging else min(nums)
+
+
+def _worst_case_pred(val, severity_rank: list) -> Optional[str]:
+    """Reduces a scalar-or-list dbNSFP prediction letter code to a
+    single code, preferring whichever entry in severity_rank (ordered
+    most- to least-damaging) is present across transcripts."""
+    codes = {str(v) for v in _flatten_values(val)}
+    if not codes:
+        return None
+    for code in severity_rank:
+        if code in codes:
+            return code
+    return next(iter(codes))
+
+
+POLYPHEN2_LABELS = {"D": "Probably damaging", "P": "Possibly damaging", "B": "Benign"}
+POLYPHEN2_RANK = ["D", "P", "B"]
+
+SIFT_LABELS = {"D": "Deleterious", "T": "Tolerated"}
+SIFT_RANK = ["D", "T"]
+
+MUTATIONTASTER_LABELS = {
+    "A": "Disease causing (high-confidence)",
+    "D": "Disease causing",
+    "N": "Polymorphism (benign)",
+    "P": "Polymorphism (high-confidence benign)",
+}
+MUTATIONTASTER_RANK = ["A", "D", "N", "P"]
+
+
+def _fmt_score(value, decimals: int = 3) -> str:
+    """Formats a plain numeric score, or '-' if it's missing."""
+    return f"{value:.{decimals}f}" if isinstance(value, (int, float)) else "-"
+
+
+def _fmt_af(value) -> str:
+    """Formats an allele frequency in scientific notation, or '-' if
+    it's missing."""
+    return f"{value:.2e}" if isinstance(value, (int, float)) else "-"
+
+
+def _fmt_text(value) -> str:
+    """Formats a plain text/identifier field, or '-' if it's missing."""
+    return str(value) if value else "-"
+
+
+def _fmt_predictor_grid_entry(score, code, label, decimals: int = 3):
+    """Builds the (value, caption) pair for a predictor that carries
+    both a numeric score and a code/label pair, following this order
+    of preference:
+      1. Score available          -> score is the value; 'CODE \u2014 Label'
+                                      is the caption underneath.
+      2. Score missing, code/label
+         available                -> 'CODE \u2014 Label' becomes the value
+                                      itself (no separate caption).
+      3. Neither available        -> value is '-'.
+    """
+    if code and label and code != label:
+        code_label = f"{code} \u2014 {label}"
+    else:
+        code_label = label or code
+
+    if isinstance(score, (int, float)):
+        return f"{score:.{decimals}f}", code_label
+    if code_label:
+        return code_label, None
+    return "-", None
+
+
+def query_dbnsfp(chrom: str, pos: str, ref: str, alt: str, genome: str = "hg38", timeout: int = 20):
+    """Single-variant lookup against MyVariant.info (mirrors dbNSFP +
+    dbSNP + ClinVar + gnomAD for the same variant). Returns the
+    annotation dict, or a dict with an 'error' key on failure / no hit."""
+    hgvs = build_genomic_hgvs(chrom, pos, ref, alt)
+    params = {"fields": MYVARIANT_FIELDS}
+    if genome == "hg38":
+        params["assembly"] = "hg38"
+    url = MYVARIANT_URL_TMPL.format(hgvs=hgvs)
+    try:
+        r = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=timeout)
+    except Exception as e:
+        return {"error": str(e), "hgvs": hgvs}
+
+    if r.status_code == 404:
+        return {"error": f"No dbNSFP/MyVariant.info record found for {hgvs}.", "hgvs": hgvs}
+    try:
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"error": f"{e} (HTTP {r.status_code})", "hgvs": hgvs}
+
+    if isinstance(data, dict) and data.get("success") is False:
+        return {"error": data.get("error", "MyVariant.info returned no annotation."), "hgvs": hgvs}
+
+    data["_hgvs"] = hgvs
+    return data
+
+
+def dbnsfp_popmax_af(annotation: dict) -> float:
+    """Best-effort popmax allele frequency: prefers an explicit dbNSFP
+    popmax field, falls back to the max across gnomAD exome/genome
+    population subsets MyVariant.info exposes."""
+    explicit = _first_present(
+        annotation,
+        "dbnsfp.gnomad4.1_joint.af_popmax",
+        "dbnsfp.gnomad.af_popmax",
+        "dbnsfp.gnomad4.af_popmax_joint",
+    )
+    if explicit is not None:
+        try:
+            return float(explicit)
+        except (TypeError, ValueError):
+            pass
+
+    candidates = []
+    for src in ("gnomad_exome", "gnomad_genome"):
+        block = annotation.get(src) or {}
+        af_block = block.get("af") or {}
+        if isinstance(af_block, dict):
+            for key, val in af_block.items():
+                if key.startswith("af_") and isinstance(val, (int, float)):
+                    candidates.append(val)
+            if isinstance(af_block.get("af"), (int, float)):
+                candidates.append(af_block["af"])
+    return max(candidates) if candidates else 0.0
+
+
+def dbnsfp_homozygotes_observed(annotation: dict) -> bool:
+    total = 0
+    for src in ("gnomad_exome", "gnomad_genome"):
+        block = annotation.get(src) or {}
+        hom_block = block.get("hom") or {}
+        if isinstance(hom_block, dict):
+            for val in hom_block.values():
+                if isinstance(val, (int, float)):
+                    total += val
+        elif isinstance(hom_block, (int, float)):
+            total += hom_block
+    return total > 0
+
+
+def dbnsfp_molecular_class(annotation: dict) -> MolecularClass:
+    effect = str(_first_present(
+        annotation,
+        "dbnsfp.ensembl.consequence",
+        "dbnsfp.vep.consequence",
+        "dbnsfp.genename",  # placeholder path kept out of the OR chain below
+        default="",
+    ) or "").lower()
+    # genename above is never an effect string; re-derive cleanly:
+    effect = str(_first_present(
+        annotation,
+        "dbnsfp.ensembl.consequence",
+        "dbnsfp.vep.consequence",
+        default="",
+    ) or "").lower()
+
+    if effect in DBNSFP_TRUNCATING_EFFECTS:
+        return MolecularClass.TRUNCATING
+    if effect in DBNSFP_INFRAME_EFFECTS:
+        return MolecularClass.INFRAME_INDEL
+    if effect in DBNSFP_MISSENSE_EFFECTS:
+        return MolecularClass.MISSENSE
+    return MolecularClass.SPLICE_OR_SYNONYMOUS
+
+
+def dbnsfp_revel_score(annotation: dict) -> Optional[float]:
+    val = _first_present(annotation, "dbnsfp.revel.score", "dbnsfp.revel_score")
+    return _worst_case_score(val)
+
+
+def dbnsfp_alphamissense_score(annotation: dict) -> Optional[float]:
+    val = _first_present(annotation, "dbnsfp.alphamissense.score", "dbnsfp.alphamissense_score")
+    return _worst_case_score(val)
+
+
+def dbnsfp_cadd_phred(annotation: dict) -> Optional[float]:
+    val = _first_present(annotation, "cadd.phred", "dbnsfp.cadd.phred", "dbnsfp.cadd_phred")
+    return _worst_case_score(val)
+
+
+def dbnsfp_1000g_af(annotation: dict) -> Optional[float]:
+    """1000 Genomes Project Phase 3 global allele frequency (via dbNSFP).
+    Field name starts with a digit in dbNSFP's own schema ('1000Gp3'),
+    so MyVariant.info exposes it as the string key '1000gp3'."""
+    val = _first_present(
+        annotation,
+        "dbnsfp.1000gp3.af",
+        "dbnsfp.1000gp3.gaf",
+        "dbnsfp.1000gp3_af",
+    )
+    return _worst_case_score(val)
+
+
+def dbnsfp_exac_af(annotation: dict) -> Optional[float]:
+    """ExAC allele frequency \u2014 prefers MyVariant.info's dedicated
+    'exac' data source block (same af.af shape as gnomad_exome/
+    gnomad_genome), falls back to the copy dbNSFP itself carries.
+    Note: ExAC is superseded by gnomAD (which absorbed the ExAC
+    samples) \u2014 shown here for reference/cross-checking only, not
+    used in BA1/BS1/PM2 below."""
+    af_block = (annotation.get("exac") or {}).get("af") or {}
+    if isinstance(af_block, dict) and isinstance(af_block.get("af"), (int, float)):
+        return float(af_block["af"])
+    val = _first_present(annotation, "dbnsfp.exac.af", "dbnsfp.exac_af")
+    return _worst_case_score(val)
+
+
+def dbnsfp_polyphen2_score(annotation: dict):
+    """Returns (score, code, label). Prefers PolyPhen2 HDIV (the variant
+    ACMG/AMP guidance historically referenced), falls back to HVAR.
+    Multiple transcripts are reduced to the single worst-case (most
+    damaging) score and prediction."""
+    score = _first_present(
+        annotation,
+        "dbnsfp.polyphen2.hdiv.score", "dbnsfp.polyphen2_hdiv_score",
+        "dbnsfp.polyphen2.hvar.score", "dbnsfp.polyphen2_hvar_score",
+    )
+    pred = _first_present(
+        annotation,
+        "dbnsfp.polyphen2.hdiv.pred", "dbnsfp.polyphen2_hdiv_pred",
+        "dbnsfp.polyphen2.hvar.pred", "dbnsfp.polyphen2_hvar_pred",
+    )
+    code = _worst_case_pred(pred, POLYPHEN2_RANK)
+    label = POLYPHEN2_LABELS.get(code, code) if code else None
+    return _worst_case_score(score), code, label
+
+
+def dbnsfp_sift_score(annotation: dict):
+    """Returns (score, code, label). Unlike most predictors here, SIFT
+    is inverted \u2014 LOWER means more damaging (conventionally <=0.05
+    is 'deleterious'), so the worst-case score is the MINIMUM across
+    transcripts, not the maximum."""
+    score = _first_present(annotation, "dbnsfp.sift.score", "dbnsfp.sift_score")
+    pred = _first_present(annotation, "dbnsfp.sift.pred", "dbnsfp.sift_pred")
+    code = _worst_case_pred(pred, SIFT_RANK)
+    label = SIFT_LABELS.get(code, code) if code else None
+    return _worst_case_score(score, higher_is_more_damaging=False), code, label
+
+
+def dbnsfp_mutationtaster_score(annotation: dict):
+    """Returns (score, code, label). MutationTaster's own prediction
+    codes (A/D/N/P) aren't self-explanatory on their own, so the label
+    spells them out \u2014 e.g. code 'N', label 'Polymorphism (benign)'."""
+    score = _first_present(annotation, "dbnsfp.mutationtaster.score", "dbnsfp.mutationtaster_score")
+    pred = _first_present(annotation, "dbnsfp.mutationtaster.pred", "dbnsfp.mutationtaster_pred")
+    code = _worst_case_pred(pred, MUTATIONTASTER_RANK)
+    label = MUTATIONTASTER_LABELS.get(code, code) if code else None
+    return _worst_case_score(score), code, label
+
+
+def dbnsfp_splice_score(annotation: dict) -> Optional[float]:
+    """dbNSFP itself doesn't carry SpliceAI (it's an nsSNV/ssSNV
+    predictor database, not a splicing-specific one); dbscSNV's ADA/RF
+    ensemble scores are the closest 0-1 splice-impact proxy it ships,
+    used here as a stand-in for the pipeline's SpliceAI-delta slot."""
+    ada = _first_present(annotation, "dbscsnv.ada_score", "dbnsfp.dbscsnv.ada_score")
+    rf = _first_present(annotation, "dbscsnv.rf_score", "dbnsfp.dbscsnv.rf_score")
+    vals = [v for v in (ada, rf) if isinstance(v, (int, float))]
+    return max(vals) if vals else None
+
+
+def dbnsfp_rsid(annotation: dict) -> Optional[str]:
+    return _first_present(annotation, "dbsnp.rsid")
+
+
+def dbnsfp_clinvar_ids(annotation: dict):
+    """Returns (variant_id, list_of_rcv_accessions) — MyVariant.info's
+    ClinVar block. variant_id is what NCBI's /clinvar/variation/<id>/
+    permalink expects."""
+    clinvar = annotation.get("clinvar") or {}
+    variant_id = clinvar.get("variant_id")
+    rcv = clinvar.get("rcv")
+    if isinstance(rcv, dict):
+        rcv = [rcv]
+    accessions = [r.get("accession") for r in (rcv or []) if isinstance(r, dict) and r.get("accession")]
+    return variant_id, accessions
+
+
+def dbnsfp_to_case_kwargs(annotation: dict) -> dict:
+    gene = _first_present(annotation, "dbnsfp.genename", "dbnsfp.hgnc_id", default="")
+    if isinstance(gene, list):
+        gene = gene[0] if gene else ""
+    return {
+        "gene": gene,
+        "molecular_class": dbnsfp_molecular_class(annotation),
+        "gnomad_popmax_faf": dbnsfp_popmax_af(annotation),
+        "healthy_homozygotes_observed": dbnsfp_homozygotes_observed(annotation),
+        "revel_score": dbnsfp_revel_score(annotation),
+        "spliceai_delta": dbnsfp_splice_score(annotation),
+    }
+
+
+def dbnsfp_acmg_table_rows(annotation: dict, case_kwargs: dict):
+    rows = []
+    popmax = case_kwargs["gnomad_popmax_faf"]
+
+    if popmax > 0.05:
+        rows.append(("BA1", "Stand-alone", -8))
+    elif popmax > 0.0001:
+        rows.append(("BS1", "Strong", -4))
+
+    if case_kwargs["healthy_homozygotes_observed"]:
+        rows.append(("BS2", "Strong", -4))
+
+    if popmax == 0.0:
+        rows.append(("PM2", "Moderate", 2))
+
+    revel = case_kwargs["revel_score"]
+    if revel is not None:
+        if revel >= 0.932:
+            rows.append(("PP3", "Strong", 4))
+        elif revel >= 0.773:
+            rows.append(("PP3", "Moderate", 2))
+        elif revel >= 0.644:
+            rows.append(("PP3", "Supporting", 1))
+        elif revel <= 0.016:
+            rows.append(("BP4", "Strong", -4))
+        elif revel <= 0.183:
+            rows.append(("BP4", "Moderate", -2))
+        elif revel <= 0.290:
+            rows.append(("BP4", "Supporting", -1))
+
+    table = []
+    for code, strength_label, points in rows:
+        desc = ACMG_CRITERIA_DESCRIPTIONS.get(code, "\u2014")
+        basis = ACMG_CRITERIA_BASIS.get(code)
+        if basis:
+            desc = f"{desc} \u2014 based on {basis}"
+        table.append({
+            "Criterion": code,
+            "Description": desc,
+            "Strength": strength_label,
+            "Points": "Stand-alone" if strength_label == "Stand-alone" else f"{points:+d}",
+        })
+    return table
+
+
+# =====================================================================
+# STEP 6 (REPLACED) — UI: dbNSFP (via MyVariant.info) annotation
+# =====================================================================
+
+def render_compact_metric_grid(items, columns: int = 6):
+
+    for start in range(0, len(items), columns):
+        row_items = items[start:start + columns]
+        cols = st.columns(columns)
+        for col, item in zip(cols, row_items):
+            label, value = item[0], item[1]
+            caption = item[2] if len(item) > 2 else None
+            with col:
+                st.markdown(
+                    f"<div style='font-size:0.72em;color:#5a6675;"
+                    f"line-height:1.2;margin-bottom:2px'>{label}</div>"
+                    f"<div style='font-size:1.05em;font-weight:600;"
+                    f"line-height:1.25;word-break:break-word'>{value}</div>"
+                    + (
+                        f"<div style='font-size:0.68em;color:#8a97a8;"
+                        f"margin-top:1px'>{caption}</div>"
+                        if caption else ""
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+
+def render_dbnsfp_case_section():
+    if not st.session_state.get("reclass_variants"):
+        return
+
+    st.divider()
+    variants = st.session_state["reclass_variants"]
+    labels = [f"{v['gene_symbol']} {v['hgvs_c'] or v['hgvs_genomic']}" for v in variants]
+    selected_idx = st.selectbox(
+        "Variant", options=range(len(variants)), format_func=lambda i: labels[i], key="dbnsfp_variant_select"
+    )
+    target = variants[selected_idx]
+
+    # Fetch automatically as soon as a variant is selected — re-fetches only
+    # when the selected variant actually changes, not on every rerun.
+    cache_key = f"{target['chromosome']}:{target['position']}:{target['ref_allele']}:{target['alt_allele']}"
+    if st.session_state.get("dbnsfp_cache_key") != cache_key:
+        with st.spinner("Fetching annotation scores..."):
+            st.session_state["dbnsfp_result"] = query_dbnsfp(
+                target["chromosome"], target["position"], target["ref_allele"], target["alt_allele"]
+            )
+        st.session_state["dbnsfp_cache_key"] = cache_key
+
+    annotation = st.session_state.get("dbnsfp_result")
+    if not annotation:
+        return
+
+    if annotation.get("error"):
+        st.error(f"Annotation lookup failed: {annotation['error']}")
+        st.caption(f"Queried as: `{annotation.get('hgvs', '?')}`")
+        return
+
+    case_kwargs = dbnsfp_to_case_kwargs(annotation)
+    rsid = dbnsfp_rsid(annotation)
+    clinvar_variant_id, clinvar_accessions = dbnsfp_clinvar_ids(annotation)
+
+    # --- Identifiers + gnomAD + 1000G/ExAC, as one compact 6-column grid ---
+    st.subheader("Population frequency")
+    popmax = case_kwargs["gnomad_popmax_faf"]
+    kg_af = dbnsfp_1000g_af(annotation)
+    exac_af = dbnsfp_exac_af(annotation)
+
+    render_compact_metric_grid([
+        ("dbSNP rsID", _fmt_text(rsid)),
+        ("ClinVar variation ID", _fmt_text(clinvar_variant_id)),
+        ("gnomAD popmax AF", f"{popmax:.2e}" if popmax else "0 (absent)"),
+        ("Homozygotes observed", "Yes" if case_kwargs["healthy_homozygotes_observed"] else "No"),
+        ("1000 Genomes AF", _fmt_af(kg_af)),
+        ("ExAC AF", _fmt_af(exac_af)),
+    ], columns=6)
+
+
+    # --- All available in-silico scores, same compact 6-column grid ---
+    st.subheader("In-silico scores")
+    revel_val = case_kwargs["revel_score"]
+    alpha_val = dbnsfp_alphamissense_score(annotation)
+    cadd_val = dbnsfp_cadd_phred(annotation)
+    polyphen2_score, polyphen2_code, polyphen2_label = dbnsfp_polyphen2_score(annotation)
+    sift_score, sift_code, sift_label = dbnsfp_sift_score(annotation)
+    mt_score, mt_code, mt_label = dbnsfp_mutationtaster_score(annotation)
+
+    polyphen2_value, polyphen2_caption = _fmt_predictor_grid_entry(polyphen2_score, polyphen2_code, polyphen2_label)
+    sift_value, sift_caption = _fmt_predictor_grid_entry(sift_score, sift_code, sift_label)
+    mt_value, mt_caption = _fmt_predictor_grid_entry(mt_score, mt_code, mt_label)
+
+    render_compact_metric_grid([
+        ("REVEL", _fmt_score(revel_val)),
+        ("AlphaMissense", _fmt_score(alpha_val)),
+        ("CADD phred", _fmt_score(cadd_val, decimals=2)),
+        ("PolyPhen2 (HDIV)", polyphen2_value, polyphen2_caption),
+        ("SIFT", sift_value, sift_caption),
+        ("MutationTaster", mt_value, mt_caption),
+    ], columns=6)
+
+    splice_val = case_kwargs["spliceai_delta"]
+    if splice_val is not None:
+        st.caption(
+            f"Splice-impact proxy (dbscSNV ADA/RF max, standing in for SpliceAI \u2014 "
+            f"dbNSFP does not itself carry SpliceAI): {splice_val:.3f}"
+        )
+
+    rows = dbnsfp_acmg_table_rows(annotation, case_kwargs)
+    if rows:
+        st.subheader("Total scores")
+        st.table(rows)
+        has_standalone = any(r["Points"] == "Stand-alone" for r in rows)
+        if has_standalone:
+            st.markdown("**Total points:** Stand-alone (BA1)")
+            classification = "Benign / Likely Benign"
+        else:
+            total = sum(int(r["Points"]) for r in rows)
+            st.markdown(f"**Total points:** {total:+d}")
+            classification = classify_from_points(total)
+        st.markdown(f"**Classification based on these scores:** {badge(classification)}", unsafe_allow_html=True)
+    else:
+        st.info("No population-frequency or REVEL-based criteria triggered by the scores above.")
+
+
+render_dbnsfp_case_section()
