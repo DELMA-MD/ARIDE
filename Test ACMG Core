@@ -1,0 +1,459 @@
+"""
+test_acmg_core.py — regression tests for each defect fixed in the refactor.
+
+Run:  python -m pytest test_acmg_core.py -v
+  or: python test_acmg_core.py      (falls back to a plain runner)
+"""
+
+from __future__ import annotations
+
+import math
+
+from acmg_core import (
+    ALPHAMISSENSE_BENIGN, BA1_ALLELE_FREQUENCY, DBSCSNV_CUTOFF,
+    MIN_ALLELE_NUMBER_FOR_ABSENCE, REVEL_BP4_VERY_STRONG,
+    Classification, DiseaseModel, EvidenceLine, FrequencyEvidence, GeneValidity,
+    InSilicoEvidence, Inheritance, MolecularClass, PipelineResult, Strength,
+    VUSResolutionPipeline, VariantCase, Zygosity,
+    assess_annotation, classify_from_points, evaluate_frequency,
+    evaluate_missense_insilico, evaluate_splice_insilico, parse_frequency,
+    check_mutual_exclusivity,
+)
+
+AR = DiseaseModel(name="AR inherited retinal disease", inheritance=Inheritance.AR)
+AD = DiseaseModel(name="AD inherited retinal disease", inheritance=Inheritance.AD)
+
+
+# ---------------------------------------------------------------------
+# 1. The Strength enum alias bug
+# ---------------------------------------------------------------------
+
+def test_standalone_is_not_an_alias_for_very_strong():
+    """The original code had VERY_STRONG = 8 and STAND_ALONE = 8, which Python
+    collapses into aliases, so every PVS1 was reported as 'stand-alone'."""
+    assert Strength.STAND_ALONE is not Strength.VERY_STRONG
+    assert Strength.STAND_ALONE.label == "StandAlone"
+    assert Strength.VERY_STRONG.label == "VeryStrong"
+    assert len(list(Strength)) == 5
+
+
+def test_pvs1_very_strong_is_not_reported_as_standalone():
+    pvs1 = EvidenceLine("PVS1", Strength.VERY_STRONG, "Step3a")
+    assert pvs1.is_standalone is False
+    assert pvs1.points == 8
+    assert pvs1.points_display == "+8"
+
+    ba1 = EvidenceLine("BA1", Strength.STAND_ALONE, "Step1")
+    assert ba1.is_standalone is True
+    assert ba1.points_display == "Stand-alone"
+
+
+# ---------------------------------------------------------------------
+# 2. Classification bands, including the LB/B split at -7
+# ---------------------------------------------------------------------
+
+def test_classification_bands():
+    assert classify_from_points(12) is Classification.PATHOGENIC
+    assert classify_from_points(10) is Classification.PATHOGENIC
+    assert classify_from_points(9) is Classification.LIKELY_PATHOGENIC
+    assert classify_from_points(6) is Classification.LIKELY_PATHOGENIC
+    assert classify_from_points(5) is Classification.VUS
+    assert classify_from_points(0) is Classification.VUS
+
+
+def test_likely_benign_and_benign_are_separate():
+    """The original collapsed everything <= -1 into 'Likely Benign / Benign'."""
+    assert classify_from_points(-1) is Classification.LIKELY_BENIGN
+    assert classify_from_points(-4) is Classification.LIKELY_BENIGN   # one BS1
+    assert classify_from_points(-6) is Classification.LIKELY_BENIGN
+    assert classify_from_points(-7) is Classification.BENIGN
+    assert classify_from_points(-8) is Classification.BENIGN          # two Strong benign
+
+
+# ---------------------------------------------------------------------
+# 3. Retired criteria and mutual exclusivity
+# ---------------------------------------------------------------------
+
+def test_retired_codes_are_rejected():
+    for code in ("PP5", "BP6"):
+        try:
+            EvidenceLine(code, Strength.SUPPORTING, "test")
+        except ValueError as exc:
+            assert "retired" in str(exc).lower()
+        else:
+            raise AssertionError(f"{code} should have been rejected")
+
+
+def test_unknown_code_rejected():
+    try:
+        EvidenceLine("PX9", Strength.SUPPORTING, "test")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("PX9 should have been rejected")
+
+
+def test_mutual_exclusivity_detected():
+    conflicts = check_mutual_exclusivity([
+        EvidenceLine("PM4", Strength.MODERATE, "x"),
+        EvidenceLine("BP3", Strength.SUPPORTING, "x"),
+    ])
+    assert len(conflicts) == 1 and "PM4" in conflicts[0]
+
+
+# ---------------------------------------------------------------------
+# 4. Maximum credible allele frequency (Whiffin 2017)
+# ---------------------------------------------------------------------
+
+def test_max_credible_af_is_gene_and_disease_specific():
+    ar = AR.max_credible_af
+    ad = AD.max_credible_af
+    # AR ceiling is far above the hardcoded 1e-4 the original used...
+    assert ar > 1e-3, ar
+    # ...and the AD ceiling is far below it.
+    assert ad < 1e-5, ad
+    assert ar > ad
+
+
+def test_max_credible_af_matches_the_formula():
+    d = DiseaseModel(inheritance=Inheritance.AR, prevalence=1 / 3000,
+                     max_gene_contribution=0.10, max_allelic_contribution=0.05,
+                     penetrance=1.0)
+    expected = math.sqrt((1 / 3000) * 0.10 * 0.05)
+    assert abs(d.max_credible_af - expected) < 1e-12
+
+
+def test_bs1_uses_the_disease_ceiling_not_a_constant():
+    """AF 2.72e-4 — the rs749219852 case from the screenshot. Under the old
+    hardcoded 1e-4 it triggered BS1; under an AR retinal ceiling it does not."""
+    freq = FrequencyEvidence(popmax_af=2.72e-4, allele_number=1_400_000)
+    ar_lines, _ = evaluate_frequency(freq, AR)
+    ad_lines, _ = evaluate_frequency(freq, AD)
+    assert [e.code for e in ar_lines] == []          # below the AR ceiling
+    assert "BS1" in [e.code for e in ad_lines]       # above the AD ceiling
+
+
+# ---------------------------------------------------------------------
+# 5. BA1 terminality
+# ---------------------------------------------------------------------
+
+def test_ba1_is_terminal_and_stops_evaluation():
+    freq = FrequencyEvidence(popmax_af=0.08, allele_number=1_400_000, hom_count=50)
+    lines, _ = evaluate_frequency(freq, AR)
+    assert [e.code for e in lines] == ["BA1"]        # BS2 never evaluated
+    assert lines[0].is_standalone
+
+    assessment = assess_annotation(freq, InSilicoEvidence(revel=0.95),
+                                   MolecularClass.MISSENSE, AR)
+    assert assessment.standalone
+    assert assessment.classification is Classification.BENIGN
+    assert assessment.total_points is None           # not netted against PP3
+
+
+def test_ba1_threshold_is_five_percent():
+    assert BA1_ALLELE_FREQUENCY == 0.05
+    just_under = FrequencyEvidence(popmax_af=0.049, allele_number=1_400_000)
+    lines, _ = evaluate_frequency(just_under, AR)
+    assert [e.code for e in lines] == ["BS1"]
+
+
+# ---------------------------------------------------------------------
+# 6. PM2 coverage gating
+# ---------------------------------------------------------------------
+
+def test_pm2_not_awarded_when_gnomad_record_is_missing():
+    """The original returned 0.0 for a missing gnomAD block and awarded PM2."""
+    missing = FrequencyEvidence()                    # popmax_af is None
+    lines, caveats = evaluate_frequency(missing, AR)
+    assert lines == []
+    assert any("not assessed" in c for c in caveats)
+
+
+def test_pm2_not_awarded_at_low_coverage():
+    shallow = FrequencyEvidence(popmax_af=0.0, allele_number=1_000)
+    lines, caveats = evaluate_frequency(shallow, AR)
+    assert [e.code for e in lines] == []
+    assert any("allele number" in c for c in caveats)
+
+
+def test_pm2_awarded_as_supporting_at_adequate_coverage():
+    """ClinGen SVI 2020 downgrades PM2 from Moderate to Supporting."""
+    covered = FrequencyEvidence(popmax_af=0.0,
+                                allele_number=MIN_ALLELE_NUMBER_FOR_ABSENCE + 1)
+    lines, _ = evaluate_frequency(covered, AR)
+    assert len(lines) == 1
+    assert lines[0].code == "PM2"
+    assert lines[0].strength is Strength.SUPPORTING
+    assert lines[0].points == 1                      # not 2
+
+
+# ---------------------------------------------------------------------
+# 7. BS2
+# ---------------------------------------------------------------------
+
+def test_bs2_scales_with_homozygote_count():
+    one = FrequencyEvidence(popmax_af=1e-4, allele_number=1_400_000, hom_count=1)
+    two = FrequencyEvidence(popmax_af=1e-4, allele_number=1_400_000, hom_count=2)
+    assert [e.strength for e in evaluate_frequency(one, AR)[0] if e.code == "BS2"] == [Strength.SUPPORTING]
+    assert [e.strength for e in evaluate_frequency(two, AR)[0] if e.code == "BS2"] == [Strength.STRONG]
+
+
+def test_bs2_not_auto_applied_for_dominant_disease():
+    freq = FrequencyEvidence(popmax_af=1e-6, allele_number=1_400_000, hom_count=0)
+    lines, caveats = evaluate_frequency(freq, AD)
+    assert "BS2" not in [e.code for e in lines]
+    assert any("age-matched" in c for c in caveats)
+
+
+# ---------------------------------------------------------------------
+# 8. REVEL bands, including the previously missing Very Strong benign
+# ---------------------------------------------------------------------
+
+def test_revel_pathogenic_bands():
+    for score, strength in [(0.95, Strength.STRONG), (0.80, Strength.MODERATE),
+                            (0.70, Strength.SUPPORTING)]:
+        line, _ = evaluate_missense_insilico(InSilicoEvidence(revel=score))
+        assert line is not None and line.code == "PP3" and line.strength is strength
+
+
+def test_revel_benign_bands_including_very_strong():
+    for score, strength in [(0.002, Strength.VERY_STRONG), (0.010, Strength.STRONG),
+                            (0.10, Strength.MODERATE), (0.25, Strength.SUPPORTING)]:
+        line, _ = evaluate_missense_insilico(InSilicoEvidence(revel=score))
+        assert line is not None and line.code == "BP4", score
+        assert line.strength is strength, (score, line.strength)
+    assert REVEL_BP4_VERY_STRONG == 0.003
+
+
+def test_revel_indeterminate_band_yields_nothing():
+    line, notes = evaluate_missense_insilico(InSilicoEvidence(revel=0.45))
+    assert line is None
+    assert any("indeterminate" in n for n in notes)
+
+
+def test_alphamissense_used_only_when_revel_absent():
+    both = InSilicoEvidence(revel=0.95, alphamissense=0.01)
+    line, _ = evaluate_missense_insilico(both)
+    assert line.code == "PP3"                        # REVEL wins, not a vote
+
+    alpha_only = InSilicoEvidence(alphamissense=ALPHAMISSENSE_BENIGN - 0.01)
+    line, _ = evaluate_missense_insilico(alpha_only)
+    assert line.code == "BP4" and line.strength is Strength.SUPPORTING
+
+
+def test_cadd_never_generates_a_criterion():
+    line, notes = evaluate_missense_insilico(InSilicoEvidence(cadd_phred=35.0))
+    assert line is None
+    assert any("No calibrated missense predictor" in n for n in notes)
+
+
+# ---------------------------------------------------------------------
+# 9. dbscSNV is scored on its own scale, not SpliceAI's
+# ---------------------------------------------------------------------
+
+def test_dbscsnv_uses_its_own_cutoff():
+    """0.55 is below dbscSNV's 0.6 cutoff but above SpliceAI's 0.5 — the
+    original code would have called it splice-altering."""
+    assert DBSCSNV_CUTOFF == 0.6
+    line, _ = evaluate_splice_insilico(InSilicoEvidence(dbscsnv_max=0.55))
+    assert line.code == "BP4"
+    line, _ = evaluate_splice_insilico(InSilicoEvidence(dbscsnv_max=0.75))
+    assert line.code == "PP3" and line.strength is Strength.SUPPORTING
+
+
+def test_spliceai_preferred_over_dbscsnv():
+    both = InSilicoEvidence(spliceai_delta=0.85, dbscsnv_max=0.10)
+    line, _ = evaluate_splice_insilico(both)
+    assert line.code == "PP3" and line.strength is Strength.MODERATE
+    assert "SpliceAI" in line.note
+
+
+# ---------------------------------------------------------------------
+# 10. BP7 requires both arms
+# ---------------------------------------------------------------------
+
+def test_bp7_requires_splice_quiet_and_low_conservation():
+    quiet_unconserved = InSilicoEvidence(spliceai_delta=0.02, phylop=0.3)
+    result = assess_annotation(
+        FrequencyEvidence(popmax_af=0.0, allele_number=1_400_000),
+        quiet_unconserved, MolecularClass.SYNONYMOUS, AR)
+    assert "BP7" in [e.code for e in result.evidence]
+
+    quiet_conserved = InSilicoEvidence(spliceai_delta=0.02, phylop=5.0)
+    result = assess_annotation(
+        FrequencyEvidence(popmax_af=0.0, allele_number=1_400_000),
+        quiet_conserved, MolecularClass.SYNONYMOUS, AR)
+    assert "BP7" not in [e.code for e in result.evidence]
+    assert any("conserved" in c for c in result.caveats)
+
+
+# ---------------------------------------------------------------------
+# 11. Caveats name what was not automatable
+# ---------------------------------------------------------------------
+
+def test_assessment_lists_unassessed_criteria():
+    result = assess_annotation(
+        FrequencyEvidence(popmax_af=1e-6, allele_number=1_400_000),
+        InSilicoEvidence(revel=0.80), MolecularClass.MISSENSE, AR)
+    joined = " ".join(result.caveats)
+    for code in ("PS3", "PM3", "PP1", "PM1"):
+        assert code in joined
+
+
+def test_truncating_variant_does_not_auto_apply_pvs1():
+    result = assess_annotation(
+        FrequencyEvidence(popmax_af=0.0, allele_number=1_400_000),
+        InSilicoEvidence(), MolecularClass.TRUNCATING, AR)
+    assert "PVS1" not in [e.code for e in result.evidence]
+    assert any("NMD decision tree" in c for c in result.caveats)
+
+
+def test_inframe_indel_needs_repeat_context():
+    freq = FrequencyEvidence(popmax_af=0.0, allele_number=1_400_000)
+    unknown = assess_annotation(freq, InSilicoEvidence(), MolecularClass.INFRAME_INDEL, AR)
+    assert "PM4" not in [e.code for e in unknown.evidence]
+    assert any("repeat" in c for c in unknown.caveats)
+
+    non_repeat = assess_annotation(freq, InSilicoEvidence(), MolecularClass.INFRAME_INDEL,
+                                   AR, in_repeat_region=False)
+    assert "PM4" in [e.code for e in non_repeat.evidence]
+
+    repeat = assess_annotation(freq, InSilicoEvidence(), MolecularClass.INFRAME_INDEL,
+                               AR, in_repeat_region=True)
+    assert "BP3" in [e.code for e in repeat.evidence]
+
+
+# ---------------------------------------------------------------------
+# 12. parse_frequency distinguishes absent from uncalled
+# ---------------------------------------------------------------------
+
+def test_parse_frequency_returns_none_when_no_gnomad_block():
+    freq = parse_frequency({"dbnsfp": {"genename": "EYS"}})
+    assert freq.in_gnomad is False
+    assert freq.effective_af is None
+
+
+def test_parse_frequency_reads_an_hom_and_af():
+    payload = {
+        "gnomad_exome": {
+            "af": {"af": 2.72e-4, "af_afr": 1.0e-4, "af_sas": 9.9e-4},
+            "an": {"an": 1_400_000},
+            "hom": {"hom": 0},
+        }
+    }
+    freq = parse_frequency(payload)
+    assert freq.in_gnomad is True
+    assert abs(freq.popmax_af - 9.9e-4) < 1e-12      # popmax across populations
+    assert freq.allele_number == 1_400_000
+    assert freq.adequately_covered is True
+    assert freq.uses_point_estimate is True          # no FAF95 in the payload
+
+
+# ---------------------------------------------------------------------
+# 13. The pipeline actually runs now
+# ---------------------------------------------------------------------
+
+def _base_case(**kw) -> VariantCase:
+    defaults = dict(
+        variant_id="TEST:c.1A>G",
+        gene="TESTGENE",
+        inheritance=Inheritance.AR,
+        gene_validity=GeneValidity.DEFINITIVE,
+        molecular_class=MolecularClass.MISSENSE,
+        disease=AR,
+        frequency=FrequencyEvidence(popmax_af=0.0, allele_number=1_400_000),
+        insilico=InSilicoEvidence(revel=0.95),
+        zygosity=Zygosity.COMP_HET_AR,
+    )
+    defaults.update(kw)
+    return VariantCase(**defaults)
+
+
+def test_pipeline_runs_end_to_end():
+    result = VUSResolutionPipeline().run(_base_case())
+    assert isinstance(result, PipelineResult)
+    assert result.trail                                # the trail is populated
+    assert isinstance(result.classification, Classification)
+
+
+def test_pipeline_ba1_short_circuits_to_benign():
+    case = _base_case(frequency=FrequencyEvidence(popmax_af=0.12, allele_number=1_400_000))
+    result = VUSResolutionPipeline().run(case)
+    assert result.classification is Classification.BENIGN
+    assert result.points_display == "Stand-alone (BA1)"
+
+
+def test_pipeline_gene_validity_caps_at_vus():
+    case = _base_case(gene_validity=GeneValidity.REFUTED)
+    result = VUSResolutionPipeline().run(case)
+    assert result.classification is Classification.VUS
+    assert "gene validity" in result.terminal
+
+
+def test_pipeline_upgrades_with_pvs1_plus_pm3():
+    case = _base_case(
+        molecular_class=MolecularClass.TRUNCATING,
+        nmd_competent=True,
+        established_lof_mechanism=True,
+        insilico=InSilicoEvidence(),
+        zygosity=Zygosity.COMP_HET_AR,
+        phase_result="trans",
+        trans_allele_is_pathogenic=True,
+    )
+    result = VUSResolutionPipeline().run(case)
+    codes = {e.code for e in result.evidence}
+    assert {"PVS1", "PM3", "PM2"} <= codes
+    # PVS1 8 + PM3 2 + PM2 1 = 11
+    assert result.total_points == 11
+    assert result.classification is Classification.PATHOGENIC
+
+
+def test_pipeline_flags_conflicting_strong_evidence():
+    case = _base_case(
+        insilico=InSilicoEvidence(revel=0.99),          # PP3 Strong
+        zygosity=Zygosity.HET_DOMINANT,
+        segregates_with_disease=False,                  # BS4 Strong
+    )
+    result = VUSResolutionPipeline().run(case)
+    assert result.classification is Classification.VUS
+    assert "Conflicting" in result.terminal
+
+
+def test_pipeline_reanalysis_parks_vus():
+    case = _base_case(
+        insilico=InSilicoEvidence(revel=0.45),          # indeterminate
+        zygosity=Zygosity.COMP_HET_AR,
+        parents_available=False,
+        reads_shared_for_phasing=False,
+    )
+    result = VUSResolutionPipeline().run(case)
+    assert result.classification is Classification.VUS
+
+
+def test_pipeline_report_renders():
+    text = VUSResolutionPipeline().run(_base_case()).report()
+    assert "Final classification:" in text
+    assert "Decision trail:" in text
+
+
+# ---------------------------------------------------------------------
+
+def _run_all() -> int:
+    import traceback
+    fns = [(n, f) for n, f in sorted(globals().items())
+           if n.startswith("test_") and callable(f)]
+    failures = 0
+    for name, fn in fns:
+        try:
+            fn()
+            print(f"  PASS  {name}")
+        except Exception:                               # noqa: BLE001
+            failures += 1
+            print(f"  FAIL  {name}")
+            traceback.print_exc()
+    print(f"\n{len(fns) - failures}/{len(fns)} passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_all())
