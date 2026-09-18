@@ -1,0 +1,558 @@
+"""
+app.py — Streamlit front end for the ARIDE VUS reclassification workflow.
+
+All classification logic lives in acmg_core.py. This file only collects input
+and renders results, which is why the engine is testable and why there is now
+one scoring path rather than two.
+
+Run:  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import streamlit as st
+
+from acmg_core import (
+    ACMG_CRITERIA_BASIS, ACMG_CRITERIA_DESCRIPTIONS, BA1_ALLELE_FREQUENCY,
+    Classification, DiseaseModel, FrequencyEvidence, GeneValidity,
+    InSilicoEvidence, Inheritance, MolecularClass, Strength,
+    VUSResolutionPipeline, VariantCase, Zygosity,
+    assess_annotation, parse_annotation, query_clinvar, query_myvariant,
+)
+
+# =====================================================================
+# Presentation helpers
+# =====================================================================
+
+CLASS_COLORS = {
+    "pathogenic": "#b23b3b",
+    "likely pathogenic": "#c9645a",
+    "pathogenic/likely pathogenic": "#b23b3b",
+    "uncertain significance": "#c98a1a",
+    "vus": "#c98a1a",
+    "benign": "#2a7f4f",
+    "likely benign": "#4f9f6f",
+    "benign/likely benign": "#2a7f4f",
+    "conflicting classifications of pathogenicity": "#8a5fb2",
+}
+
+
+def badge(classification) -> str:
+    text = classification.value if isinstance(classification, Classification) else str(classification)
+    color = CLASS_COLORS.get(text.strip().lower(), "#5a6675")
+    return (
+        f'<span style="background:{color};color:white;padding:2px 10px;'
+        f'border-radius:12px;font-size:0.85em;font-weight:600">{text}</span>'
+    )
+
+
+def needs_reclassification(classification: str) -> bool:
+    c = classification.strip().lower()
+    settled = ("pathogenic" in c or "benign" in c) and "conflicting" not in c and "uncertain" not in c
+    return not settled
+
+
+def fmt_score(value, decimals: int = 3) -> str:
+    return f"{value:.{decimals}f}" if isinstance(value, (int, float)) else "-"
+
+
+def fmt_af(value) -> str:
+    return f"{value:.2e}" if isinstance(value, (int, float)) else "-"
+
+
+def fmt_text(value) -> str:
+    return str(value) if value else "-"
+
+
+def predictor_cell(triple, decimals: int = 3):
+    """(score, code, label) -> (display value, caption)."""
+    if not triple:
+        return "-", None
+    score, code, label = triple
+    caption = f"{code} — {label}" if code and label and code != label else (label or code)
+    if isinstance(score, (int, float)):
+        return f"{score:.{decimals}f}", caption
+    return (caption or "-"), None
+
+
+def metric_grid(items, columns: int = 6) -> None:
+    for start in range(0, len(items), columns):
+        for col, item in zip(st.columns(columns), items[start:start + columns]):
+            label, value = item[0], item[1]
+            caption = item[2] if len(item) > 2 else None
+            with col:
+                st.markdown(
+                    f"<div style='font-size:0.72em;color:#5a6675;line-height:1.2;"
+                    f"margin-bottom:2px'>{label}</div>"
+                    f"<div style='font-size:1.05em;font-weight:600;line-height:1.25;"
+                    f"word-break:break-word'>{value}</div>"
+                    + (f"<div style='font-size:0.68em;color:#8a97a8;margin-top:1px'>{caption}</div>"
+                       if caption else ""),
+                    unsafe_allow_html=True,
+                )
+
+
+# =====================================================================
+# Cached network calls
+# =====================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_clinvar(gene: str, variant: str):
+    return query_clinvar(gene, variant)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_myvariant(chrom: str, pos: str, ref: str, alt: str, assembly: str):
+    return query_myvariant(chrom, pos, ref, alt, assembly=assembly)
+
+
+# =====================================================================
+# Slide 1 — ClinVar verification
+# =====================================================================
+
+def render_clinvar_slide() -> None:
+    st.title("ClinVar Verification")
+    st.caption("Check whether this variant already has a settled classification")
+
+    with st.form("intake_form"):
+        c1, c2 = st.columns(2)
+        gene = c1.text_input("Gene", placeholder="e.g. EYS")
+        variant = c2.text_input("HGVS variant (c. notation)", placeholder="e.g. c.9270_9271insA")
+        submitted = st.form_submit_button("Check in ClinVar")
+
+    if submitted:
+        if not gene.strip() or not variant.strip():
+            st.warning("Enter both a gene symbol and a variant.")
+            return
+
+        with st.spinner(f"Querying ClinVar for {gene} {variant}..."):
+            try:
+                results, error = cached_clinvar(gene.strip(), variant.strip()), None
+            except Exception as exc:                      # noqa: BLE001
+                results, error = None, exc
+
+        if error is not None:
+            st.error(f"ClinVar lookup failed: {error}")
+            return
+
+        st.session_state.pop("reclass_variants", None)
+        st.session_state.pop("dbnsfp_cache_key", None)
+
+        if not results:
+            st.info(f"No ClinVar record for {gene} {variant}. Proceed to reclassification.")
+            st.session_state["start"] = {"gene": gene, "variant": variant, "status": "not_found"}
+        else:
+            st.success(f"Found {len(results)} ClinVar record(s)")
+            for rec in results:
+                st.markdown(
+                    f"**{rec['title']}**  \n"
+                    f"{badge(rec['classification'])} &nbsp;·&nbsp; "
+                    f"Review status: {rec['review_status'] or '—'} &nbsp;·&nbsp; "
+                    f"Last evaluated: {rec['last_evaluated'] or '—'}  \n"
+                    f"[View in ClinVar]({rec['link']}) &nbsp;·&nbsp; `{rec['accession']}`",
+                    unsafe_allow_html=True,
+                )
+                st.divider()
+
+            primary = results[0]["classification"].strip().lower()
+            if needs_reclassification(primary):
+                msg = ("Conflicting classifications in ClinVar."
+                       if "conflicting" in primary else "Uncertain significance.")
+                st.warning(f"{msg} Proceed to reclassification.")
+            else:
+                label = "Pathogenic" if "pathogenic" in primary else "Benign"
+                st.success(f"Already classified as {label}. Reclassification is not needed.")
+
+            st.session_state["start"] = {"gene": gene, "variant": variant,
+                                         "status": primary, "records": results}
+
+    if "start" in st.session_state:
+        st.divider()
+        enabled = needs_reclassification(st.session_state["start"]["status"])
+        if st.button("Reclassification →", disabled=not enabled, use_container_width=True):
+            st.session_state["view"] = "reclass"
+            st.rerun()
+
+
+# =====================================================================
+# Slide 2 — variant intake, disease model, annotation, scoring
+# =====================================================================
+
+def render_variant_form() -> None:
+    st.title("Variant Intake")
+    st.caption("Genomic coordinates for the annotation lookup")
+
+    prior = st.session_state.get("start", {})
+
+    with st.form("variant_form"):
+        c1, c2, c3, c4 = st.columns(4)
+        gene_symbol = c1.text_input("Gene symbol", value=prior.get("gene", ""), placeholder="ARL6")
+        transcript_id = c2.text_input("Transcript ID", placeholder="NM_177976.3")
+        chromosome = c3.text_input("Chromosome", placeholder="3")
+        position = c4.text_input("Position", placeholder="97784972")
+
+        c5, c6, c7, c8 = st.columns(4)
+        ref_allele = c5.text_input("Reference allele", placeholder="T")
+        alt_allele = c6.text_input("Alternate allele", placeholder="C")
+        hgvs_c = c7.text_input("HGVS coding (c.)", value=prior.get("variant", ""), placeholder="c.272T>C")
+        hgvs_p = c8.text_input("HGVS protein (p.)", placeholder="p.Ile91Thr")
+
+        assembly = st.radio("Genome build", ["hg38", "hg19"], horizontal=True)
+        submitted = st.form_submit_button("Submit variant")
+
+    if not submitted:
+        return
+
+    required = {
+        "Gene symbol": gene_symbol, "Transcript ID": transcript_id,
+        "Chromosome": chromosome, "Position": position,
+        "Reference allele": ref_allele, "Alternate allele": alt_allele,
+        "HGVS coding (c.)": hgvs_c, "HGVS protein (p.)": hgvs_p,
+    }
+    missing = [k for k, v in required.items() if not v.strip()]
+    if missing:
+        st.error(f"Missing required field(s): {', '.join(missing)}")
+        return
+
+    record = {
+        "gene_symbol": gene_symbol.strip(), "transcript_id": transcript_id.strip(),
+        "chromosome": chromosome.strip(), "position": position.strip(),
+        "ref_allele": ref_allele.strip().upper(), "alt_allele": alt_allele.strip().upper(),
+        "hgvs_c": hgvs_c.strip(), "hgvs_p": hgvs_p.strip(), "assembly": assembly,
+    }
+    variants = st.session_state.setdefault("reclass_variants", [])
+    # Guard against the duplicate append on rerun that the original had.
+    if record not in variants:
+        variants.append(record)
+
+
+def render_disease_model() -> DiseaseModel:
+    """BS1 depends on the disease, not on a constant. Collect the parameters."""
+    st.subheader("Disease model")
+    st.caption(
+        "BS1 compares the observed frequency against a maximum credible allele "
+        "frequency computed from these numbers (Whiffin 2017), not against a fixed cutoff."
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    inh_label = c1.selectbox("Inheritance", ["Autosomal recessive", "Autosomal dominant", "X-linked"])
+    prevalence_denom = c2.number_input("Prevalence 1 in", min_value=100, max_value=1_000_000,
+                                       value=3000, step=100)
+    gene_share = c3.number_input("Max gene contribution", min_value=0.001, max_value=1.0,
+                                 value=0.10, step=0.01, format="%.3f")
+    allele_share = c4.number_input("Max allelic contribution", min_value=0.001, max_value=1.0,
+                                   value=0.05, step=0.01, format="%.3f")
+    penetrance = c5.number_input("Penetrance", min_value=0.05, max_value=1.0,
+                                 value=1.0, step=0.05, format="%.2f")
+
+    inheritance = {
+        "Autosomal recessive": Inheritance.AR,
+        "Autosomal dominant": Inheritance.AD,
+        "X-linked": Inheritance.XL,
+    }[inh_label]
+
+    disease = DiseaseModel(
+        name=inh_label.lower(), inheritance=inheritance,
+        prevalence=1 / prevalence_denom, max_gene_contribution=gene_share,
+        max_allelic_contribution=allele_share, penetrance=penetrance,
+    )
+    st.caption(
+        f"Maximum credible allele frequency: **{disease.max_credible_af:.2e}** "
+        f"(BA1 remains fixed at {BA1_ALLELE_FREQUENCY:.0%})"
+    )
+    return disease
+
+
+def render_annotation_and_score(disease: DiseaseModel) -> None:
+    variants = st.session_state.get("reclass_variants")
+    if not variants:
+        return
+
+    st.divider()
+    labels = [f"{v['gene_symbol']} {v['hgvs_c'] or v['hgvs_p']}" for v in variants]
+    idx = st.selectbox("Variant", range(len(variants)), format_func=lambda i: labels[i],
+                       key="variant_select")
+    target = variants[idx]
+
+    with st.spinner("Fetching annotation..."):
+        annotation = cached_myvariant(target["chromosome"], target["position"],
+                                      target["ref_allele"], target["alt_allele"],
+                                      target.get("assembly", "hg38"))
+
+    if annotation.get("error"):
+        st.error(f"Annotation lookup failed: {annotation['error']}")
+        st.caption(f"Queried as `{annotation.get('hgvs', '?')}`")
+        return
+
+    parsed = parse_annotation(annotation)
+    freq: FrequencyEvidence = parsed["frequency"]
+    insilico: InSilicoEvidence = parsed["insilico"]
+    molecular_class: MolecularClass = parsed["molecular_class"]
+
+    # --- Population frequency ---------------------------------------
+    st.subheader("Population frequency")
+    if not freq.in_gnomad:
+        st.warning(
+            "No gnomAD record was returned. Absence from the API is not absence from the "
+            "population, so no frequency criterion is applied."
+        )
+    metric_grid([
+        ("dbSNP rsID", fmt_text(parsed["rsid"])),
+        ("ClinVar variation ID", fmt_text(parsed["clinvar_variant_id"])),
+        ("gnomAD popmax AF", fmt_af(freq.popmax_af) if freq.observed
+         else ("0 (absent)" if freq.in_gnomad else "no record")),
+        ("FAF95", fmt_af(freq.faf95) if freq.faf95 is not None else "not available"),
+        ("Allele number", f"{freq.allele_number:,}" if freq.allele_number else "-"),
+        ("Homozygotes", str(freq.hom_count)),
+    ], columns=6)
+    metric_grid([
+        ("Hemizygotes", str(freq.hemi_count)),
+        ("1000 Genomes AF", fmt_af(parsed["thousand_genomes_af"])),
+        ("ExAC AF", fmt_af(parsed["exac_af"])),
+        ("Consequence", molecular_class.value),
+        ("Source", freq.source or "-"),
+        ("Coverage adequate", "Yes" if freq.adequately_covered else "No"),
+    ], columns=6)
+
+    # --- Predictors --------------------------------------------------
+    st.subheader("In-silico scores")
+    pp2_val, pp2_cap = predictor_cell(insilico.polyphen2)
+    sift_val, sift_cap = predictor_cell(insilico.sift)
+    mt_val, mt_cap = predictor_cell(insilico.mutationtaster)
+
+    metric_grid([
+        ("REVEL", fmt_score(insilico.revel)),
+        ("AlphaMissense", fmt_score(insilico.alphamissense)),
+        ("SpliceAI Δ", fmt_score(insilico.spliceai_delta, 2)),
+        ("dbscSNV ADA/RF", fmt_score(insilico.dbscsnv_max)),
+        ("phyloP", fmt_score(insilico.phylop, 2)),
+        ("GERP++", fmt_score(insilico.gerp, 2)),
+    ], columns=6)
+
+    st.caption("Display only — not used for ACMG scoring")
+    metric_grid([
+        ("CADD phred", fmt_score(insilico.cadd_phred, 2)),
+        ("PolyPhen2", pp2_val, pp2_cap),
+        ("SIFT", sift_val, sift_cap),
+        ("MutationTaster", mt_val, mt_cap),
+    ], columns=4)
+    st.caption(
+        "MutationTaster's number is the model's confidence in its own call, not a "
+        "pathogenicity score. CADD is not calibrated to ACMG evidence tiers, so neither "
+        "drives a criterion."
+    )
+
+    # --- Repeat-region context for PM4 / BP3 -------------------------
+    in_repeat = None
+    if molecular_class == MolecularClass.INFRAME_INDEL:
+        choice = st.radio(
+            "Is this in-frame indel inside a repeat or low-complexity region? "
+            "(decides PM4 vs BP3 — check RepeatMasker or UniProt)",
+            ["Unknown", "No — non-repeat region", "Yes — repeat region"], horizontal=True,
+        )
+        in_repeat = {"Unknown": None, "No — non-repeat region": False,
+                     "Yes — repeat region": True}[choice]
+
+    # --- Automated assessment ----------------------------------------
+    assessment = assess_annotation(freq, insilico, molecular_class, disease,
+                                   in_repeat_region=in_repeat)
+
+    st.subheader("Automated ACMG assessment")
+    rows = assessment.table_rows(ACMG_CRITERIA_DESCRIPTIONS, ACMG_CRITERIA_BASIS)
+    if rows:
+        st.table(rows)
+        st.markdown(f"**Total points:** {assessment.points_display}")
+    else:
+        st.info("No criterion was triggered by the annotation data alone.")
+        st.markdown("**Total points:** 0")
+
+    st.markdown(
+        f"**Classification from annotation data alone:** {badge(assessment.classification)}",
+        unsafe_allow_html=True,
+    )
+    if assessment.classification is Classification.VUS:
+        st.caption(
+            "This is a partial score. It reflects only the criteria a database lookup can "
+            "decide, so it is a starting point for the resolution pipeline, not a report."
+        )
+
+    for conflict in assessment.conflicts:
+        st.error(f"Criterion conflict: {conflict}")
+
+    if assessment.caveats:
+        with st.expander(f"Caveats and unassessed criteria ({len(assessment.caveats)})"):
+            for c in assessment.caveats:
+                st.markdown(f"- {c}")
+
+    st.session_state["assessment_inputs"] = {
+        "variant_id": f"{target['gene_symbol']} {target['hgvs_c']}",
+        "gene": target["gene_symbol"], "frequency": freq, "insilico": insilico,
+        "molecular_class": molecular_class, "disease": disease,
+    }
+
+
+# =====================================================================
+# Slide 2b — clinical evidence and the resolution pipeline
+# =====================================================================
+
+def render_pipeline_section() -> None:
+    inputs = st.session_state.get("assessment_inputs")
+    if not inputs:
+        return
+
+    st.divider()
+    st.subheader("VUS resolution pipeline")
+    st.caption(
+        "Adds the case-level evidence no annotation API can supply, then runs the "
+        "eight-step escalation and re-scores."
+    )
+
+    with st.form("pipeline_form"):
+        c1, c2, c3 = st.columns(3)
+        validity_label = c1.selectbox(
+            "ClinGen gene-disease validity",
+            ["Definitive", "Strong", "Moderate", "Limited", "Disputed", "Refuted", "No known relationship"],
+        )
+        zyg_label = c2.selectbox(
+            "Zygosity",
+            ["Unspecified", "Homozygous (AR gene)", "Two het in same AR gene",
+             "Single het in AR gene", "Het in dominant gene", "Hemizygous (XL male)"],
+        )
+        months = c3.number_input("Months since last reanalysis", 0, 120, 0)
+
+        st.markdown("**Loss of function (truncating variants)**")
+        c4, c5, c6 = st.columns(3)
+        nmd_label = c4.selectbox("NMD competent?", ["Unknown", "Yes", "No"])
+        lof_mechanism = c5.checkbox("LoF is an established mechanism", value=True)
+        critical_label = c6.selectbox("Removes a critical region?", ["Unknown", "Yes", "No"])
+
+        st.markdown("**Phasing and second allele**")
+        c7, c8, c9 = st.columns(3)
+        phase_label = c7.selectbox("Phase", ["Not determined", "Trans", "Cis"])
+        trans_pathogenic = c8.checkbox("Second allele is P/LP")
+        parents = c9.checkbox("Parental samples available")
+
+        c10, c11, c12 = st.columns(3)
+        cnv_found = c10.checkbox("Exon-level CNV found")
+        phenotype_match = c11.checkbox("Phenotype strongly matches the gene")
+        complex_sv = c12.checkbox("Complex SV locus (e.g. RPGR-ORF15)")
+
+        st.markdown("**Segregation and de novo**")
+        c13, c14, c15 = st.columns(3)
+        seg_label = c13.selectbox("Segregation", ["No data", "Tracks with disease", "Fails to track"])
+        meioses = c14.number_input("Informative meioses", 0, 30, 0)
+        denovo_label = c15.selectbox("De novo", ["No", "Yes — confirmed", "Yes — unconfirmed"])
+        pheno_spec = st.radio("Phenotype specificity for de novo weighting",
+                              ["specific", "consistent", "nonspecific"], index=1, horizontal=True)
+
+        st.markdown("**Functional evidence**")
+        c16, c17, c18 = st.columns(3)
+        assay_available = c16.checkbox("Validated assay available")
+        assay_result = c17.selectbox("Assay result", ["indeterminate", "pathogenic", "benign"])
+        oddspath = c18.number_input("OddsPath (0 = uncalibrated)", 0.0, 1000.0, 0.0, step=0.1)
+
+        run = st.form_submit_button("Run pipeline")
+
+    if not run:
+        return
+
+    case = VariantCase(
+        variant_id=inputs["variant_id"],
+        gene=inputs["gene"],
+        inheritance=inputs["disease"].inheritance,
+        gene_validity={
+            "Definitive": GeneValidity.DEFINITIVE, "Strong": GeneValidity.STRONG,
+            "Moderate": GeneValidity.MODERATE, "Limited": GeneValidity.LIMITED,
+            "Disputed": GeneValidity.DISPUTED, "Refuted": GeneValidity.REFUTED,
+            "No known relationship": GeneValidity.NO_KNOWN,
+        }[validity_label],
+        molecular_class=inputs["molecular_class"],
+        disease=inputs["disease"],
+        frequency=inputs["frequency"],
+        insilico=inputs["insilico"],
+        nmd_competent={"Unknown": None, "Yes": True, "No": False}[nmd_label],
+        established_lof_mechanism=lof_mechanism,
+        removes_critical_region={"Unknown": None, "Yes": True, "No": False}[critical_label],
+        zygosity={
+            "Unspecified": None,
+            "Homozygous (AR gene)": Zygosity.HOM_AR,
+            "Two het in same AR gene": Zygosity.COMP_HET_AR,
+            "Single het in AR gene": Zygosity.SINGLE_HET_AR,
+            "Het in dominant gene": Zygosity.HET_DOMINANT,
+            "Hemizygous (XL male)": Zygosity.HEMI_XL_MALE,
+        }[zyg_label],
+        phase_result={"Not determined": None, "Trans": "trans", "Cis": "cis"}[phase_label],
+        trans_allele_is_pathogenic=trans_pathogenic,
+        parents_available=parents,
+        cnv_found=cnv_found or None,
+        phenotype_strongly_matches_gene=phenotype_match,
+        complex_sv_locus=complex_sv,
+        segregates_with_disease={"No data": None, "Tracks with disease": True,
+                                 "Fails to track": False}[seg_label],
+        informative_meioses=int(meioses),
+        apparent_de_novo=denovo_label.startswith("Yes") or None,
+        de_novo_confirmed=denovo_label == "Yes — confirmed",
+        phenotype_specificity=pheno_spec,
+        functional_assay_available=assay_available,
+        functional_assay_result=assay_result if assay_available else None,
+        functional_assay_oddspath=oddspath if oddspath > 0 else None,
+        months_since_last_run=int(months),
+    )
+
+    result = VUSResolutionPipeline().run(case)
+
+    st.markdown(f"### {result.classification.value}")
+    st.markdown(
+        f"{badge(result.classification)} &nbsp;·&nbsp; Points: **{result.points_display}** "
+        f"&nbsp;·&nbsp; Terminal: {result.terminal}",
+        unsafe_allow_html=True,
+    )
+    if result.next_action:
+        st.info(f"Next action: {result.next_action}")
+
+    if result.evidence:
+        st.table([{
+            "Criterion": e.code,
+            "Description": ACMG_CRITERIA_DESCRIPTIONS.get(e.code, "-"),
+            "Strength": e.strength.label,
+            "Points": e.points_display,
+            "Detail": e.note,
+        } for e in result.evidence])
+
+    for c in result.caveats:
+        st.warning(c)
+
+    with st.expander("Decision trail"):
+        for i, step in enumerate(result.trail, 1):
+            st.markdown(f"{i}. {step}")
+
+    st.download_button("Download report", result.report(),
+                       file_name=f"{case.variant_id.replace(' ', '_')}_acmg.txt")
+
+
+def render_reclass_slide() -> None:
+    if st.button("← Back to ClinVar check"):
+        st.session_state["view"] = "clinvar"
+        st.rerun()
+
+    render_variant_form()
+    disease = render_disease_model()
+    render_annotation_and_score(disease)
+    render_pipeline_section()
+
+
+# =====================================================================
+# Entry point
+# =====================================================================
+
+def main() -> None:
+    st.set_page_config(page_title="VUS Reclassification", page_icon="\U0001F9EC", layout="wide")
+    st.session_state.setdefault("view", "clinvar")
+    if st.session_state["view"] == "clinvar":
+        render_clinvar_slide()
+    else:
+        render_reclass_slide()
+
+
+if __name__ == "__main__":
+    main()
