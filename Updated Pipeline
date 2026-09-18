@@ -1,0 +1,1635 @@
+"""
+acmg_core.py — ACMG/AMP variant classification engine.
+
+Pure logic plus annotation retrieval. No Streamlit import, so this module can be
+imported from a notebook, a batch script, or a test suite — which is what makes
+the VUS pipeline verifiable instead of dormant.
+
+Every threshold constant carries its source inline. Full citations are in the
+project document "ACMG/AMP Criteria Reference".
+
+Design rule: there is exactly ONE scoring path. `assess_annotation()` builds
+evidence lines; `VUSResolutionPipeline` extends the same evidence list; both
+end at `classify_from_points()`. The previous version had two independent
+scoring implementations that disagreed with each other.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Optional
+
+import requests
+
+__all__ = [
+    "Strength", "Classification", "EvidenceLine", "classify_from_points",
+    "Inheritance", "MolecularClass", "GeneValidity", "Zygosity",
+    "DiseaseModel", "FrequencyEvidence", "InSilicoEvidence",
+    "AutomatedAssessment", "assess_annotation",
+    "VariantCase", "PipelineResult", "VUSResolutionPipeline",
+    "query_myvariant", "query_clinvar", "parse_annotation",
+]
+
+
+# =====================================================================
+# 1. Evidence strength
+# =====================================================================
+
+class Strength(Enum):
+    """ACMG evidence strength tiers, with Tavtigian (2020) point weights.
+
+    FIX — this was a genuine bug. The previous version declared
+    ``VERY_STRONG = 8`` and ``STAND_ALONE = 8``. Python's Enum collapses
+    duplicate values into aliases, so ``Strength.STAND_ALONE is
+    Strength.VERY_STRONG`` evaluated True and every PVS1 Very Strong variant
+    was reported as "stand-alone", skipping the point total entirely.
+    Tuple values keep the two members distinct.
+    """
+
+    STAND_ALONE = ("StandAlone", 8)
+    VERY_STRONG = ("VeryStrong", 8)
+    STRONG = ("Strong", 4)
+    MODERATE = ("Moderate", 2)
+    SUPPORTING = ("Supporting", 1)
+
+    def __init__(self, label: str, points: int) -> None:
+        self.label = label
+        self.points = points
+
+    def __str__(self) -> str:  # pragma: no cover - display only
+        return self.label
+
+
+# --- Criterion registry ----------------------------------------------
+
+PATHOGENIC_CODES = frozenset({
+    "PVS1",
+    "PS1", "PS2", "PS3", "PS4",
+    "PM1", "PM2", "PM3", "PM4", "PM5", "PM6",
+    "PP1", "PP2", "PP3", "PP4", "PP5",
+})
+
+BENIGN_CODES = frozenset({
+    "BA1",
+    "BS1", "BS2", "BS3", "BS4",
+    "BP1", "BP2", "BP3", "BP4", "BP5", "BP6", "BP7",
+})
+
+ALL_CODES = PATHOGENIC_CODES | BENIGN_CODES
+
+#: Withdrawn by ClinGen SVI in 2018 (Biesecker & Harrison, Genet Med 20:1687).
+#: They double-count another laboratory's evidence. Never emit these.
+RETIRED_CODES = frozenset({"PP5", "BP6"})
+
+#: Pairs that can never be co-applied to a single variant.
+MUTUALLY_EXCLUSIVE: tuple[tuple[str, str], ...] = (
+    ("PS1", "PM5"),    # same-residue evidence, one or the other
+    ("PM4", "BP3"),    # in-frame indel: non-repeat vs repeat region
+    ("PVS1", "PM4"),   # protein-length change is subsumed by PVS1
+    ("PP3", "BP4"),    # computational evidence points one way only
+)
+
+
+@dataclass
+class EvidenceLine:
+    """One applied ACMG criterion at a chosen strength."""
+
+    code: str
+    strength: Strength
+    step: str = ""
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        code = self.code.upper()
+        if code in RETIRED_CODES:
+            raise ValueError(
+                f"{code} was retired by ClinGen SVI (2018) and must not be applied. "
+                "Retrieve and evaluate the underlying evidence directly instead."
+            )
+        if code not in ALL_CODES:
+            raise ValueError(f"{code} is not an ACMG/AMP criterion.")
+        self.code = code
+
+    @property
+    def is_benign(self) -> bool:
+        return self.code in BENIGN_CODES
+
+    @property
+    def is_standalone(self) -> bool:
+        """BA1 only. Terminal — ends the evaluation, not merely -8 points."""
+        return self.strength is Strength.STAND_ALONE
+
+    @property
+    def points(self) -> int:
+        return (-1 if self.is_benign else 1) * self.strength.points
+
+    @property
+    def points_display(self) -> str:
+        return "Stand-alone" if self.is_standalone else f"{self.points:+d}"
+
+
+def check_mutual_exclusivity(evidence: list[EvidenceLine]) -> list[str]:
+    """Return a human-readable conflict for each illegal criterion pair found."""
+    codes = {e.code for e in evidence}
+    return [
+        f"{a} and {b} cannot both be applied to one variant"
+        for a, b in MUTUALLY_EXCLUSIVE
+        if a in codes and b in codes
+    ]
+
+
+# =====================================================================
+# 2. Classification bands
+# =====================================================================
+
+class Classification(Enum):
+    PATHOGENIC = "Pathogenic"
+    LIKELY_PATHOGENIC = "Likely Pathogenic"
+    VUS = "Uncertain Significance"
+    LIKELY_BENIGN = "Likely Benign"
+    BENIGN = "Benign"
+
+    def __str__(self) -> str:  # pragma: no cover - display only
+        return self.value
+
+
+def classify_from_points(total: int) -> Classification:
+    """Tavtigian (2020) naturally scaled point bands.
+
+    FIX — the previous version collapsed Likely Benign and Benign into one
+    label for everything <= -1. The boundary belongs at -7: a single Strong
+    benign criterion (-4) is Likely Benign, and two (-8) are Benign, which
+    is what the 2015 qualitative rule "either 1 BA1 or >= 2 BS" encodes.
+    """
+    if total >= 10:
+        return Classification.PATHOGENIC
+    if 6 <= total <= 9:
+        return Classification.LIKELY_PATHOGENIC
+    if total >= 0:                      # 0 to 5
+        return Classification.VUS
+    if total >= -6:                     # -1 to -6
+        return Classification.LIKELY_BENIGN
+    return Classification.BENIGN        # <= -7
+
+
+def classify_evidence(evidence: list[EvidenceLine]) -> tuple[Classification, Optional[int]]:
+    """Classify an evidence list. Returns (classification, total_points).
+
+    BA1 is terminal: it returns Benign with ``None`` points, because it is not
+    an -8 contribution that other evidence can argue down.
+    """
+    if any(e.is_standalone for e in evidence):
+        return Classification.BENIGN, None
+    total = sum(e.points for e in evidence)
+    return classify_from_points(total), total
+
+
+# =====================================================================
+# 3. Variant and disease context
+# =====================================================================
+
+class Inheritance(Enum):
+    AR = "autosomal_recessive"
+    AD = "autosomal_dominant"
+    XL = "x_linked"
+
+
+class MolecularClass(Enum):
+    TRUNCATING = "truncating"            # nonsense / frameshift / canonical +-1,2 / start-loss
+    MISSENSE = "missense"
+    INFRAME_INDEL = "inframe_indel"      # in-frame indel / stop-loss
+    SYNONYMOUS = "synonymous"            # BP7 candidate
+    SPLICE_REGION = "splice_region"      # non-canonical near-splice
+    INTRONIC_OR_UTR = "intronic_or_utr"  # deep intronic / UTR
+    OTHER = "other"
+
+    @property
+    def is_splice_like(self) -> bool:
+        return self in (
+            MolecularClass.SYNONYMOUS,
+            MolecularClass.SPLICE_REGION,
+            MolecularClass.INTRONIC_OR_UTR,
+        )
+
+    @property
+    def is_protein_altering(self) -> bool:
+        return self in (MolecularClass.MISSENSE, MolecularClass.INFRAME_INDEL)
+
+
+class GeneValidity(Enum):
+    DEFINITIVE = "definitive"
+    STRONG = "strong"
+    MODERATE = "moderate"
+    LIMITED = "limited"
+    DISPUTED = "disputed"
+    REFUTED = "refuted"
+    NO_KNOWN = "no_known_disease_relationship"
+
+    @property
+    def supports_classification(self) -> bool:
+        """Below Moderate, a variant cannot rise above VUS however strong the
+        variant-level evidence (Strande 2017; ClinGen gene-disease validity)."""
+        return self in (GeneValidity.DEFINITIVE, GeneValidity.STRONG, GeneValidity.MODERATE)
+
+
+class Zygosity(Enum):
+    HOM_AR = "homozygous_in_AR_gene"
+    COMP_HET_AR = "two_het_same_AR_gene"
+    SINGLE_HET_AR = "single_het_in_AR_gene"
+    HET_DOMINANT = "het_in_dominant_gene"
+    HEMI_XL_MALE = "hemizygous_x_linked_male"
+
+
+@dataclass(frozen=True)
+class DiseaseModel:
+    """Parameters for the Whiffin (2017) maximum credible allele frequency.
+
+    FIX — the previous version hardcoded BS1 at 1e-4 for every gene and every
+    disease. That cutoff has no basis in the guideline (Richards 2015 defines
+    BS1 only qualitatively) and systematically misclassifies recessive founder
+    alleles. Compute the ceiling from the disease instead.
+    """
+
+    name: str = "generic autosomal recessive rare disease"
+    inheritance: Inheritance = Inheritance.AR
+    prevalence: float = 1 / 3000          # all inherited retinal disease combined
+    max_gene_contribution: float = 0.10   # largest share of cases from one gene
+    max_allelic_contribution: float = 0.05  # largest share within that gene
+    penetrance: float = 1.0
+
+    @property
+    def max_credible_af(self) -> float:
+        """Allele-frequency ceiling above which the variant cannot be causal.
+
+        genotype frequency = prevalence x gene share x allele share / penetrance
+        Biallelic: AF = sqrt(genotype frequency).
+        Monoallelic: AF ~= genotype frequency / 2 for rare alleles.
+        """
+        genotype_freq = (
+            self.prevalence
+            * self.max_gene_contribution
+            * self.max_allelic_contribution
+            / max(self.penetrance, 1e-9)
+        )
+        if self.inheritance == Inheritance.AR:
+            return math.sqrt(genotype_freq)
+        return genotype_freq / 2.0
+
+
+# =====================================================================
+# 4. Evidence inputs
+# =====================================================================
+
+#: Richards 2015: BA1 is allele frequency > 5%.
+BA1_ALLELE_FREQUENCY = 0.05
+
+#: Minimum gnomAD allele number for "absent" to mean absent rather than
+#: uncalled. gnomAD v4 exomes carry AN ~1.46M at well-covered sites; this is a
+#: deliberately conservative floor. Tune per your callset.
+MIN_ALLELE_NUMBER_FOR_ABSENCE = 100_000
+
+# --- REVEL, calibrated by Pejaver 2022 (ClinGen SVI endorsed) ---------
+REVEL_PP3_STRONG = 0.932
+REVEL_PP3_MODERATE = 0.773
+REVEL_PP3_SUPPORTING = 0.644
+REVEL_BP4_SUPPORTING = 0.290
+REVEL_BP4_MODERATE = 0.183
+REVEL_BP4_STRONG = 0.016
+REVEL_BP4_VERY_STRONG = 0.003   # was missing from the previous implementation
+
+# --- AlphaMissense, Cheng 2023 (fallback when REVEL is unavailable) ---
+ALPHAMISSENSE_PATHOGENIC = 0.564
+ALPHAMISSENSE_BENIGN = 0.340
+
+# --- SpliceAI, Jaganathan 2019 ---------------------------------------
+SPLICEAI_PP3_MODERATE = 0.5
+SPLICEAI_PP3_SUPPORTING = 0.2
+SPLICEAI_BP4 = 0.1
+
+# --- dbscSNV ADA/RF, Jian 2014 ---------------------------------------
+# FIX — the previous version fed the ADA/RF score into SpliceAI's 0.5/0.2
+# thresholds. Different classifiers, different training sets, different
+# scales. dbscSNV has its own published cutoff and only covers +-3/+-8 bp.
+DBSCSNV_CUTOFF = 0.6
+
+# --- Conservation, for the second arm of BP7 -------------------------
+PHYLOP_CONSERVED = 1.0
+GERP_CONSERVED = 2.0
+
+
+@dataclass
+class FrequencyEvidence:
+    """Population frequency, with enough context to tell absent from uncalled.
+
+    FIX — the previous ``dbnsfp_popmax_af()`` returned 0.0 both when a variant
+    was genuinely absent from gnomAD and when the gnomAD block was missing from
+    the API response, so a lookup failure silently awarded PM2.
+    """
+
+    popmax_af: Optional[float] = None      # None = no gnomAD record at all
+    faf95: Optional[float] = None          # true filtering AF, when available
+    allele_number: int = 0
+    hom_count: int = 0
+    hemi_count: int = 0
+    source: str = ""
+
+    @property
+    def in_gnomad(self) -> bool:
+        return self.popmax_af is not None
+
+    @property
+    def observed(self) -> bool:
+        return bool(self.popmax_af)
+
+    @property
+    def adequately_covered(self) -> bool:
+        return self.allele_number >= MIN_ALLELE_NUMBER_FOR_ABSENCE
+
+    @property
+    def uses_point_estimate(self) -> bool:
+        """True when we fell back to popmax AF because no FAF was available.
+        Whiffin 2017 specifies the 95% CI lower bound, not the point estimate."""
+        return self.faf95 is None and self.popmax_af is not None
+
+    @property
+    def effective_af(self) -> Optional[float]:
+        if self.faf95 is not None:
+            return self.faf95
+        return self.popmax_af
+
+
+@dataclass
+class InSilicoEvidence:
+    """Predictor scores. Scored and display-only fields are kept separate so
+    that an uncalibrated tool can never leak into an ACMG criterion."""
+
+    # Calibrated — these may generate PP3/BP4
+    revel: Optional[float] = None
+    alphamissense: Optional[float] = None
+    spliceai_delta: Optional[float] = None   # true SpliceAI, if you supply it
+    dbscsnv_max: Optional[float] = None      # ADA/RF, own 0.6 scale
+
+    # Conservation — second arm of BP7 only
+    phylop: Optional[float] = None
+    gerp: Optional[float] = None
+
+    # Display only. CADD is not calibrated for ACMG evidence strength and
+    # must not drive PP3 (Pejaver 2022 discussion).
+    cadd_phred: Optional[float] = None
+    polyphen2: Optional[tuple[Optional[float], Optional[str], Optional[str]]] = None
+    sift: Optional[tuple[Optional[float], Optional[str], Optional[str]]] = None
+    mutationtaster: Optional[tuple[Optional[float], Optional[str], Optional[str]]] = None
+
+
+# --- Criterion evaluators --------------------------------------------
+
+def evaluate_frequency(
+    freq: FrequencyEvidence,
+    disease: DiseaseModel,
+    step: str = "Frequency",
+) -> tuple[list[EvidenceLine], list[str]]:
+    """BA1, BS1, BS2 and PM2 from population data."""
+    lines: list[EvidenceLine] = []
+    caveats: list[str] = []
+
+    if not freq.in_gnomad:
+        caveats.append(
+            "No gnomAD record returned — frequency criteria (BA1/BS1/BS2/PM2) "
+            "not assessed. Absence from the API is not absence from the population."
+        )
+        return lines, caveats
+
+    af = freq.effective_af or 0.0
+    ceiling = disease.max_credible_af
+
+    if freq.uses_point_estimate:
+        caveats.append(
+            "Frequency criteria used popmax point-estimate AF; no FAF95 available. "
+            "Whiffin 2017 specifies the 95% CI lower bound."
+        )
+
+    if af > BA1_ALLELE_FREQUENCY:
+        lines.append(EvidenceLine(
+            "BA1", Strength.STAND_ALONE, step,
+            f"popmax AF {af:.2e} > 5% — check the ClinGen BA1 exception list before finalising",
+        ))
+        return lines, caveats  # terminal; nothing else is evaluated
+
+    if af > ceiling:
+        lines.append(EvidenceLine(
+            "BS1", Strength.STRONG, step,
+            f"popmax AF {af:.2e} exceeds the max credible AF {ceiling:.2e} "
+            f"for {disease.name}",
+        ))
+    elif not freq.observed:
+        if freq.adequately_covered:
+            # ClinGen SVI 2020: PM2 is Supporting, not Moderate. Rarity alone
+            # is weak evidence.
+            lines.append(EvidenceLine(
+                "PM2", Strength.SUPPORTING, step,
+                f"absent from gnomAD at adequate depth (AN={freq.allele_number:,})",
+            ))
+        else:
+            caveats.append(
+                f"PM2 not applied: gnomAD allele number is only {freq.allele_number:,}, "
+                f"below the {MIN_ALLELE_NUMBER_FOR_ABSENCE:,} floor for calling a site "
+                "genuinely absent rather than uncalled."
+            )
+    elif disease.inheritance == Inheritance.AR and af < ceiling / 10:
+        lines.append(EvidenceLine(
+            "PM2", Strength.SUPPORTING, step,
+            f"popmax AF {af:.2e} is more than tenfold below the credible ceiling",
+        ))
+
+    # BS2 — healthy homozygotes / hemizygotes
+    if disease.inheritance == Inheritance.AR and freq.hom_count > 0:
+        strength = Strength.STRONG if freq.hom_count >= 2 else Strength.SUPPORTING
+        lines.append(EvidenceLine(
+            "BS2", strength, step,
+            f"{freq.hom_count} homozygote(s) in gnomAD, which is not screened for "
+            f"{disease.name}",
+        ))
+    elif disease.inheritance == Inheritance.XL and freq.hemi_count > 0:
+        strength = Strength.STRONG if freq.hemi_count >= 2 else Strength.SUPPORTING
+        lines.append(EvidenceLine(
+            "BS2", strength, step, f"{freq.hemi_count} hemizygote(s) in gnomAD",
+        ))
+    elif disease.inheritance == Inheritance.AD and freq.observed:
+        caveats.append(
+            "BS2 for a dominant disorder needs age-matched, phenotype-screened controls. "
+            "gnomAD heterozygote counts alone cannot establish it."
+        )
+
+    return lines, caveats
+
+
+def evaluate_missense_insilico(
+    insilico: InSilicoEvidence,
+    step: str = "InSilico",
+) -> tuple[Optional[EvidenceLine], list[str]]:
+    """PP3 / BP4 for missense and in-frame variants.
+
+    Uses exactly ONE predictor, preferring REVEL because its thresholds are the
+    ones ClinGen endorsed. Running several tools and counting agreement is
+    statistically invalid: they share training data and component scores, so
+    their concordance is not independent evidence.
+    """
+    revel = insilico.revel
+    if revel is not None:
+        if revel >= REVEL_PP3_STRONG:
+            return EvidenceLine("PP3", Strength.STRONG, step, f"REVEL {revel:.3f} >= {REVEL_PP3_STRONG}"), []
+        if revel >= REVEL_PP3_MODERATE:
+            return EvidenceLine("PP3", Strength.MODERATE, step, f"REVEL {revel:.3f} >= {REVEL_PP3_MODERATE}"), []
+        if revel >= REVEL_PP3_SUPPORTING:
+            return EvidenceLine("PP3", Strength.SUPPORTING, step, f"REVEL {revel:.3f} >= {REVEL_PP3_SUPPORTING}"), []
+        if revel <= REVEL_BP4_VERY_STRONG:
+            return EvidenceLine("BP4", Strength.VERY_STRONG, step, f"REVEL {revel:.3f} <= {REVEL_BP4_VERY_STRONG}"), []
+        if revel <= REVEL_BP4_STRONG:
+            return EvidenceLine("BP4", Strength.STRONG, step, f"REVEL {revel:.3f} <= {REVEL_BP4_STRONG}"), []
+        if revel <= REVEL_BP4_MODERATE:
+            return EvidenceLine("BP4", Strength.MODERATE, step, f"REVEL {revel:.3f} <= {REVEL_BP4_MODERATE}"), []
+        if revel <= REVEL_BP4_SUPPORTING:
+            return EvidenceLine("BP4", Strength.SUPPORTING, step, f"REVEL {revel:.3f} <= {REVEL_BP4_SUPPORTING}"), []
+        return None, [
+            f"REVEL {revel:.3f} falls in the indeterminate band "
+            f"({REVEL_BP4_SUPPORTING}-{REVEL_PP3_SUPPORTING}); no computational criterion applied."
+        ]
+
+    alpha = insilico.alphamissense
+    if alpha is not None:
+        if alpha >= ALPHAMISSENSE_PATHOGENIC:
+            return EvidenceLine("PP3", Strength.SUPPORTING, step, f"AlphaMissense {alpha:.3f} (REVEL unavailable)"), []
+        if alpha <= ALPHAMISSENSE_BENIGN:
+            return EvidenceLine("BP4", Strength.SUPPORTING, step, f"AlphaMissense {alpha:.3f} (REVEL unavailable)"), []
+        return None, [f"AlphaMissense {alpha:.3f} is in the ambiguous band; no criterion applied."]
+
+    return None, ["No calibrated missense predictor available; PP3/BP4 not assessed."]
+
+
+def evaluate_splice_insilico(
+    insilico: InSilicoEvidence,
+    step: str = "InSilico",
+) -> tuple[Optional[EvidenceLine], list[str]]:
+    """PP3 / BP4 for splice-region, synonymous and intronic variants.
+
+    SpliceAI is preferred. dbscSNV is used only as a fallback, on its own 0.6
+    scale, and only yields Supporting strength because it covers a narrow
+    window and is not calibrated to ACMG evidence tiers.
+    """
+    delta = insilico.spliceai_delta
+    if delta is not None:
+        if delta >= SPLICEAI_PP3_MODERATE:
+            return EvidenceLine(
+                "PP3", Strength.MODERATE, step,
+                f"SpliceAI delta {delta:.2f} >= {SPLICEAI_PP3_MODERATE} — confirm with an RNA assay",
+            ), []
+        if delta >= SPLICEAI_PP3_SUPPORTING:
+            return EvidenceLine("PP3", Strength.SUPPORTING, step, f"SpliceAI delta {delta:.2f}"), []
+        if delta < SPLICEAI_BP4:
+            return EvidenceLine("BP4", Strength.SUPPORTING, step, f"SpliceAI delta {delta:.2f} < {SPLICEAI_BP4}"), []
+        return None, [f"SpliceAI delta {delta:.2f} is in the indeterminate band; no criterion applied."]
+
+    ada_rf = insilico.dbscsnv_max
+    if ada_rf is not None:
+        if ada_rf >= DBSCSNV_CUTOFF:
+            return EvidenceLine(
+                "PP3", Strength.SUPPORTING, step,
+                f"dbscSNV ADA/RF {ada_rf:.3f} >= {DBSCSNV_CUTOFF} (SpliceAI unavailable)",
+            ), ["dbscSNV covers only +-3/+-8 bp of the splice consensus; run SpliceAI for a full assessment."]
+        return EvidenceLine(
+            "BP4", Strength.SUPPORTING, step,
+            f"dbscSNV ADA/RF {ada_rf:.3f} < {DBSCSNV_CUTOFF} (SpliceAI unavailable)",
+        ), []
+
+    return None, ["No splice predictor available; PP3/BP4 not assessed."]
+
+
+def evaluate_bp7(
+    molecular_class: MolecularClass,
+    insilico: InSilicoEvidence,
+    step: str = "InSilico",
+) -> tuple[Optional[EvidenceLine], list[str]]:
+    """BP7 — synonymous variant, splice-quiet AND not conserved.
+
+    Both arms must hold. The conservation arm is the one people skip: a
+    synonymous change at a deeply conserved nucleotide may be disrupting an
+    exonic splicing enhancer even when splice predictors are quiet.
+    """
+    if molecular_class != MolecularClass.SYNONYMOUS:
+        return None, []
+
+    delta = insilico.spliceai_delta
+    ada_rf = insilico.dbscsnv_max
+    if delta is not None:
+        splice_quiet = delta < SPLICEAI_BP4
+    elif ada_rf is not None:
+        splice_quiet = ada_rf < DBSCSNV_CUTOFF
+    else:
+        return None, ["BP7 not assessed: no splice predictor available."]
+
+    phylop, gerp = insilico.phylop, insilico.gerp
+    if phylop is not None:
+        conserved = phylop >= PHYLOP_CONSERVED
+        cons_note = f"phyloP {phylop:.2f}"
+    elif gerp is not None:
+        conserved = gerp >= GERP_CONSERVED
+        cons_note = f"GERP++ {gerp:.2f}"
+    else:
+        return None, ["BP7 not assessed: no conservation score available (second arm of the rule)."]
+
+    if splice_quiet and not conserved:
+        return EvidenceLine("BP7", Strength.SUPPORTING, step, f"synonymous, splice-quiet, {cons_note}"), []
+    if splice_quiet and conserved:
+        return None, [f"BP7 withheld: splice-quiet but the nucleotide is conserved ({cons_note})."]
+    return None, []
+
+
+# =====================================================================
+# 5. Automated assessment (what a database lookup alone can support)
+# =====================================================================
+
+#: Criteria that no annotation API can decide on its own.
+NOT_AUTOMATABLE = {
+    "PVS1": "run AutoPVS1 or the ClinGen NMD decision tree",
+    "PS1": "residue-level ClinVar lookup plus a splice check on the new nucleotide",
+    "PS2": "trio data with confirmed parentage",
+    "PS3": "published functional assay, OddsPath-calibrated",
+    "PS4": "case-control or proband counting",
+    "PM1": "domain and hot-spot curation",
+    "PM3": "confirmed phase with a second pathogenic allele",
+    "PM5": "residue-level ClinVar lookup",
+    "PM6": "trio data without confirmed parentage",
+    "PP1": "pedigree segregation",
+    "PP2": "gene-level missense constraint review",
+    "PP4": "phenotype specificity assessment",
+    "BS3": "published functional assay",
+    "BS4": "pedigree segregation",
+    "BP1": "gene mechanism review",
+    "BP2": "confirmed phase",
+    "BP5": "alternate molecular diagnosis in the same case",
+}
+
+
+@dataclass
+class AutomatedAssessment:
+    """Result of the subset of ACMG that a gnomAD + predictor lookup supports."""
+
+    evidence: list[EvidenceLine] = field(default_factory=list)
+    caveats: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    molecular_class: MolecularClass = MolecularClass.OTHER
+    disease: DiseaseModel = field(default_factory=DiseaseModel)
+
+    @property
+    def standalone(self) -> bool:
+        return any(e.is_standalone for e in self.evidence)
+
+    @property
+    def total_points(self) -> Optional[int]:
+        return None if self.standalone else sum(e.points for e in self.evidence)
+
+    @property
+    def classification(self) -> Classification:
+        return classify_evidence(self.evidence)[0]
+
+    @property
+    def points_display(self) -> str:
+        return "Stand-alone (BA1)" if self.standalone else f"{self.total_points:+d}"
+
+    def table_rows(self, descriptions: dict[str, str], bases: dict[str, str]) -> list[dict[str, str]]:
+        rows = []
+        for e in self.evidence:
+            desc = descriptions.get(e.code, "-")
+            basis = bases.get(e.code)
+            rows.append({
+                "Criterion": e.code,
+                "Description": f"{desc} — based on {basis}" if basis else desc,
+                "Strength": e.strength.label,
+                "Points": e.points_display,
+                "Detail": e.note,
+            })
+        return rows
+
+
+def assess_annotation(
+    freq: FrequencyEvidence,
+    insilico: InSilicoEvidence,
+    molecular_class: MolecularClass,
+    disease: Optional[DiseaseModel] = None,
+    in_repeat_region: Optional[bool] = None,
+) -> AutomatedAssessment:
+    """Apply every criterion that annotation data alone can support."""
+    disease = disease or DiseaseModel()
+    result = AutomatedAssessment(molecular_class=molecular_class, disease=disease)
+
+    freq_lines, freq_caveats = evaluate_frequency(freq, disease)
+    result.evidence.extend(freq_lines)
+    result.caveats.extend(freq_caveats)
+
+    if result.standalone:
+        result.caveats.append("BA1 is terminal — no further criteria were evaluated.")
+        return result
+
+    if molecular_class.is_protein_altering:
+        line, notes = evaluate_missense_insilico(insilico)
+        if line:
+            result.evidence.append(line)
+        result.caveats.extend(notes)
+    elif molecular_class.is_splice_like:
+        line, notes = evaluate_splice_insilico(insilico)
+        if line:
+            result.evidence.append(line)
+        result.caveats.extend(notes)
+        bp7, bp7_notes = evaluate_bp7(molecular_class, insilico)
+        if bp7 and not any(e.code == "PP3" for e in result.evidence):
+            result.evidence.append(bp7)
+        result.caveats.extend(bp7_notes)
+    elif molecular_class == MolecularClass.TRUNCATING:
+        result.caveats.append(
+            "Truncating variant: PVS1 requires the NMD decision tree (last exon / "
+            "last 50 bp of the penultimate exon) and confirmation that LoF is the "
+            "gene's mechanism. Not applied automatically."
+        )
+
+    # PM4 / BP3 need repeat-region context, which the API does not supply.
+    if molecular_class == MolecularClass.INFRAME_INDEL:
+        if in_repeat_region is False:
+            result.evidence.append(EvidenceLine(
+                "PM4", Strength.MODERATE, "Consequence", "in-frame indel outside a repeat region"))
+        elif in_repeat_region is True:
+            result.evidence.append(EvidenceLine(
+                "BP3", Strength.SUPPORTING, "Consequence", "in-frame indel within a repeat region"))
+        else:
+            result.caveats.append(
+                "In-frame indel: PM4 and BP3 are mutually exclusive and depend on whether "
+                "the indel sits in a repeat or low-complexity region. Check RepeatMasker "
+                "or the UniProt repeat annotation, then set in_repeat_region."
+            )
+
+    applied = {e.code for e in result.evidence}
+    missing = sorted(set(NOT_AUTOMATABLE) - applied)
+    if missing:
+        result.caveats.append(
+            "Not assessed (manual curation required): " + ", ".join(missing) + "."
+        )
+
+    result.conflicts = check_mutual_exclusivity(result.evidence)
+    return result
+
+
+# =====================================================================
+# 6. The VUS resolution pipeline
+# =====================================================================
+
+@dataclass
+class VariantCase:
+    variant_id: str
+    gene: str
+    inheritance: Inheritance = Inheritance.AR
+    gene_validity: GeneValidity = GeneValidity.DEFINITIVE
+    molecular_class: MolecularClass = MolecularClass.MISSENSE
+    disease: DiseaseModel = field(default_factory=DiseaseModel)
+
+    frequency: FrequencyEvidence = field(default_factory=FrequencyEvidence)
+    insilico: InSilicoEvidence = field(default_factory=InSilicoEvidence)
+
+    # Step 3a — LoF / NMD
+    nmd_competent: Optional[bool] = None
+    established_lof_mechanism: bool = True
+    removes_critical_region: Optional[bool] = None
+    frame_preserving: bool = False
+
+    # Step 4 — genotype
+    zygosity: Optional[Zygosity] = None
+
+    # Step 5a — autozygosity
+    in_roh: Optional[bool] = None
+    roh_length_mb: float = 0.0
+
+    # Step 5b — phasing
+    parents_available: Optional[bool] = None
+    reads_shared_for_phasing: bool = False
+    phase_result: Optional[str] = None            # "trans" | "cis" | None
+    trans_allele_is_pathogenic: bool = False      # P/LP vs merely plausible
+
+    # Step 5c — second-allele hunt
+    cnv_found: Optional[bool] = None
+    cnv_is_null: bool = False
+    phenotype_strongly_matches_gene: bool = False
+    wgs_deep_intronic_found: Optional[bool] = None
+    complex_sv_locus: bool = False
+    long_read_resolved: Optional[bool] = None
+
+    # Step 5d — segregation / de novo
+    segregates_with_disease: Optional[bool] = None
+    informative_meioses: int = 0
+    apparent_de_novo: Optional[bool] = None
+    de_novo_confirmed: Optional[bool] = None
+    phenotype_specificity: str = "consistent"     # "specific" | "consistent" | "nonspecific"
+
+    # Step 6 — functional
+    functional_assay_available: bool = False
+    functional_assay_result: Optional[str] = None  # "pathogenic" | "benign" | "indeterminate"
+    functional_assay_oddspath: Optional[float] = None
+
+    # Step 8 — reanalysis cadence
+    months_since_last_run: int = 0
+
+
+@dataclass
+class PipelineResult:
+    variant_id: str
+    classification: Classification = Classification.VUS
+    terminal: str = ""
+    evidence: list[EvidenceLine] = field(default_factory=list)
+    trail: list[str] = field(default_factory=list)
+    caveats: list[str] = field(default_factory=list)
+    next_action: str = ""
+
+    @property
+    def standalone(self) -> bool:
+        return any(e.is_standalone for e in self.evidence)
+
+    @property
+    def total_points(self) -> Optional[int]:
+        return None if self.standalone else sum(e.points for e in self.evidence)
+
+    @property
+    def points_display(self) -> str:
+        return "Stand-alone (BA1)" if self.standalone else f"{self.total_points:+d}"
+
+    def add(self, code: str, strength: Strength, step: str, note: str = "") -> None:
+        self.evidence.append(EvidenceLine(code, strength, step, note))
+
+    def log(self, msg: str) -> None:
+        self.trail.append(msg)
+
+    def finish(self, classification: Classification, terminal: str, next_action: str = "") -> "PipelineResult":
+        self.classification = classification
+        self.terminal = terminal
+        self.next_action = next_action
+        self.caveats.extend(check_mutual_exclusivity(self.evidence))
+        return self
+
+    def report(self) -> str:
+        lines = [
+            f"Variant: {self.variant_id}",
+            f"Final classification: {self.classification.value}  (points: {self.points_display})",
+            f"Terminal: {self.terminal}",
+        ]
+        if self.evidence:
+            lines.append("Evidence accumulated:")
+            for e in self.evidence:
+                detail = f" — {e.note}" if e.note else ""
+                lines.append(f"  - {e.code} ({e.strength.label}, {e.points_display}) @ {e.step}{detail}")
+        lines.append("Decision trail:")
+        for i, step in enumerate(self.trail, 1):
+            lines.append(f"  {i}. {step}")
+        for c in self.caveats:
+            lines.append(f"  ! {c}")
+        if self.next_action:
+            lines.append(f"Next action: {self.next_action}")
+        return "\n".join(lines)
+
+
+class VUSResolutionPipeline:
+    """Eight-step escalation for a variant that scored VUS on baseline ACMG."""
+
+    def run(self, case: VariantCase) -> PipelineResult:
+        r = PipelineResult(variant_id=case.variant_id)
+        r.log("START: VUS after baseline scoring -> Step 1 (re-annotate)")
+        return self.step1_reannotate(case, r)
+
+    # ---- STEP 1 — re-annotate ---------------------------------------
+    def step1_reannotate(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 1: gnomAD frequency, calibrated predictors, ClinGen gene validity")
+
+        freq_lines, freq_caveats = evaluate_frequency(case.frequency, case.disease, step="Step1")
+        r.evidence.extend(freq_lines)
+        r.caveats.extend(freq_caveats)
+
+        if r.standalone:
+            r.log("popmax AF above 5% -> BA1, terminal")
+            return r.finish(Classification.BENIGN, "Downgraded (BA1)", "Remove from the candidate list")
+
+        benign_strong = sum(1 for e in freq_lines if e.is_benign and e.strength is Strength.STRONG)
+        if benign_strong >= 2:
+            r.log("Two Strong benign frequency criteria -> Benign without further work")
+            return r.finish(Classification.BENIGN, "Downgraded", "Remove from the candidate list")
+
+        if not case.gene_validity.supports_classification:
+            r.log(f"Gene-disease validity is {case.gene_validity.value} -> capped at VUS")
+            return r.finish(
+                Classification.VUS, "Parked (gene validity)",
+                "Park pending ClinGen gene-disease re-curation",
+            )
+
+        r.log("Still uncertain -> Step 2 (molecular-class triage)")
+        return self.step2_class_triage(case, r)
+
+    # ---- STEP 2 — molecular class -----------------------------------
+    def step2_class_triage(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        mc = case.molecular_class
+        r.log(f"STEP 2: molecular class = {mc.value}")
+        if mc == MolecularClass.TRUNCATING:
+            return self.step3a_lof(case, r)
+        if mc.is_protein_altering:
+            return self.step3b_missense(case, r)
+        if mc.is_splice_like:
+            return self.step3c_splice(case, r)
+        r.log("Unclassifiable consequence -> route on genotype alone")
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 3a — PVS1 via the NMD decision tree --------------------
+    def step3a_lof(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 3a: grade PVS1 (Abou Tayoun 2018 decision tree)")
+
+        if not case.established_lof_mechanism:
+            r.log("LoF is not an established mechanism for this gene -> PVS1 not applicable")
+            r.caveats.append("PVS1 withheld: loss of function is not an established mechanism here.")
+            return self.step4_genotype(case, r)
+
+        if case.nmd_competent is None:
+            r.log("NMD status unknown -> PVS1 withheld pending AutoPVS1")
+            r.caveats.append("PVS1 withheld: NMD competence not determined. Run AutoPVS1.")
+            return self.step4_genotype(case, r)
+
+        if case.nmd_competent and not case.frame_preserving:
+            r.add("PVS1", Strength.VERY_STRONG, "Step3a",
+                  "NMD-competent region, established LoF mechanism")
+            r.log("NMD-competent -> PVS1 Very Strong")
+        elif case.removes_critical_region:
+            r.add("PVS1", Strength.STRONG, "Step3a",
+                  "NMD-escape but removes a region containing known pathogenic variants")
+            r.log("NMD-escape, critical region removed -> PVS1 Strong")
+        elif case.removes_critical_region is False:
+            r.add("PVS1", Strength.SUPPORTING, "Step3a",
+                  "NMD-escape, truncated region appears dispensable")
+            r.log("NMD-escape, dispensable region -> PVS1 Supporting")
+        else:
+            r.add("PVS1", Strength.MODERATE, "Step3a",
+                  "NMD-escape or frame-preserving; importance of the removed region unresolved")
+            r.log("NMD-escape, region importance unknown -> PVS1 Moderate")
+
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 3b — missense / in-frame -------------------------------
+    def step3b_missense(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 3b: one calibrated predictor (Pejaver 2022 thresholds)")
+        line, notes = evaluate_missense_insilico(case.insilico, step="Step3b")
+        if line:
+            r.evidence.append(line)
+            r.log(f"{line.code} {line.strength.label} — {line.note}")
+        r.caveats.extend(notes)
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 3c — splice-like ---------------------------------------
+    def step3c_splice(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 3c: splice prediction")
+        line, notes = evaluate_splice_insilico(case.insilico, step="Step3c")
+        r.caveats.extend(notes)
+
+        if line:
+            r.evidence.append(line)
+            r.log(f"{line.code} {line.strength.label} — {line.note}")
+            if line.code == "PP3":
+                r.log("Splice-altering predicted -> escalate to RNA/minigene (Step 6)")
+                return self.step6_functional(case, r)
+        else:
+            bp7, bp7_notes = evaluate_bp7(case.molecular_class, case.insilico, step="Step3c")
+            r.caveats.extend(bp7_notes)
+            if bp7:
+                r.evidence.append(bp7)
+                r.log("Synonymous, splice-quiet, not conserved -> BP7")
+
+        return self.step4_genotype(case, r)
+
+    # ---- STEP 4 — genotype triage ------------------------------------
+    def step4_genotype(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        z = case.zygosity
+        r.log(f"STEP 4: genotype triage — zygosity = {z.value if z else 'unspecified'}")
+        if z == Zygosity.HOM_AR:
+            return self.step5a_roh(case, r)
+        if z == Zygosity.COMP_HET_AR:
+            return self.step5b_phase(case, r)
+        if z == Zygosity.SINGLE_HET_AR:
+            return self.step5c_second_allele(case, r)
+        if z in (Zygosity.HET_DOMINANT, Zygosity.HEMI_XL_MALE):
+            return self.step5d_segregation(case, r)
+        r.log("Zygosity unspecified -> cannot route further")
+        return r.finish(Classification.VUS, "Parked (genotype unresolved)",
+                        "Confirm zygosity and re-run from Step 4")
+
+    # ---- STEP 5a — autozygosity mapping ------------------------------
+    def step5a_roh(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5a: runs of homozygosity (AutoMap; Quinodoz 2021)")
+        if case.in_roh and case.roh_length_mb >= 1.5:
+            r.log(f"Homozygous variant sits in a {case.roh_length_mb:.2f} Mb ROH -> locus prioritised")
+            return self.step5d_segregation(case, r)
+        r.log("Not in an ROH — consider a CNV masking apparent homozygosity")
+        r.caveats.append("Apparent homozygosity outside an ROH can be a deletion in trans. Check read depth.")
+        return self.step5c_second_allele(case, r)
+
+    # ---- STEP 5b — phasing -------------------------------------------
+    def step5b_phase(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5b: phasing — PM3 requires a confirmed trans configuration")
+
+        if case.phase_result == "cis":
+            r.add("BP2", Strength.SUPPORTING, "Step5b", "confirmed in cis with the second variant")
+            r.log("In cis -> biallelic hypothesis rejected, BP2 applied")
+            return self.step5c_second_allele(case, r)
+
+        if case.phase_result == "trans":
+            if case.trans_allele_is_pathogenic:
+                r.add("PM3", Strength.MODERATE, "Step5b",
+                      "confirmed trans with a P/LP allele (SVI 1.0 point)")
+                r.log("Confirmed trans with a pathogenic allele -> PM3 Moderate")
+            else:
+                r.add("PM3", Strength.SUPPORTING, "Step5b",
+                      "confirmed trans, second allele not yet P/LP (SVI 0.5 point)")
+                r.log("Confirmed trans with a non-P/LP allele -> PM3 Supporting")
+            return self.step6_functional(case, r)
+
+        if case.parents_available:
+            r.log("Parents available -> trio phasing pending")
+        elif case.reads_shared_for_phasing:
+            r.log("Variants share reads -> read-backed phasing (WhatsHap) pending")
+        else:
+            r.log("No parents and no shared reads -> cannot phase")
+            return r.finish(Classification.VUS, "Parked (unphased compound het)",
+                            "Obtain parental samples, or long-read / read-backed phasing")
+
+        return r.finish(Classification.VUS, "Parked (phasing pending)",
+                        "Complete trio or read-backed phasing, then re-run from Step 5b")
+
+    # ---- STEP 5c — second-allele hunt --------------------------------
+    def step5c_second_allele(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5c: second-allele hunt, cheapest escalation first")
+
+        if case.cnv_found:
+            if case.cnv_is_null:
+                r.log("Exon-level null CNV found as the second allele")
+                r.caveats.append(
+                    "PVS1 for the CNV belongs to that allele's own record, not to this variant. "
+                    "Here it counts as the confirmed second hit for PM3."
+                )
+            r.log("Second allele identified -> confirm phase")
+            return self.step5b_phase(case, r)
+
+        if case.wgs_deep_intronic_found:
+            r.log("WGS found a deep-intronic or structural second allele -> confirm by RNA")
+            return self.step6_functional(case, r)
+
+        if case.complex_sv_locus:
+            if case.long_read_resolved:
+                r.add("PM3", Strength.MODERATE, "Step5c",
+                      "breakpoints and phase resolved by long-read sequencing")
+                r.log("Complex locus resolved by long reads -> phase established")
+                return self.step6_functional(case, r)
+            r.log("Complex SV locus unresolved")
+            return r.finish(Classification.VUS, "Parked (awaiting long-read)",
+                            "Order long-read sequencing for this locus (e.g. RPGR-ORF15)")
+
+        if case.phenotype_strongly_matches_gene and case.wgs_deep_intronic_found is None:
+            r.log("CNV-negative with a strong phenotype match -> escalate to WGS")
+            return r.finish(Classification.VUS, "Parked (awaiting WGS)",
+                            "WGS for deep-intronic and structural alleles (e.g. ABCA4, USH2A)")
+
+        r.log("All second-allele avenues exhausted")
+        return self.step8_scheduled_reanalysis(case, r, from_step="Step5c")
+
+    # ---- STEP 5d — segregation and de novo ---------------------------
+    def step5d_segregation(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 5d: segregation and de novo analysis")
+
+        if case.apparent_de_novo:
+            # ClinGen SVI de novo point scale, weighted by phenotype specificity.
+            specific = case.phenotype_specificity
+            if case.de_novo_confirmed:
+                strength = {"specific": Strength.STRONG,
+                            "consistent": Strength.MODERATE}.get(specific, Strength.SUPPORTING)
+                r.add("PS2", strength, "Step5d",
+                      f"de novo confirmed by parentage testing; phenotype {specific}")
+                r.log(f"Confirmed de novo -> PS2 {strength.label}")
+            else:
+                strength = {"specific": Strength.MODERATE,
+                            "consistent": Strength.SUPPORTING}.get(specific, Strength.SUPPORTING)
+                r.add("PM6", strength, "Step5d",
+                      f"assumed de novo, parentage unconfirmed; phenotype {specific}")
+                r.log(f"Assumed de novo -> PM6 {strength.label}")
+            return self.step6_functional(case, r)
+
+        if case.segregates_with_disease is True:
+            # Jarvik & Browning 2016: ~3 meioses Supporting, ~5 Moderate, ~7 Strong.
+            m = case.informative_meioses
+            if m >= 7:
+                strength = Strength.STRONG
+            elif m >= 5:
+                strength = Strength.MODERATE
+            elif m >= 3:
+                strength = Strength.SUPPORTING
+            else:
+                r.log(f"Only {m} informative meioses — below the threshold for PP1")
+                r.caveats.append(f"PP1 withheld: {m} informative meioses, fewer than the 3 needed.")
+                return self.step6_functional(case, r)
+            r.add("PP1", strength, "Step5d", f"cosegregates across {m} informative meioses")
+            r.log(f"Segregation over {m} meioses -> PP1 {strength.label}")
+            return self.step6_functional(case, r)
+
+        if case.segregates_with_disease is False:
+            r.add("BS4", Strength.STRONG, "Step5d", "fails to track with disease in the pedigree")
+            r.caveats.append(
+                "Before accepting BS4, exclude phenocopy, reduced penetrance, non-paternity "
+                "and a second aetiology in the family."
+            )
+            r.log("Fails to segregate -> BS4")
+            return self.step7_recombine(case, r)
+
+        r.log("No segregation or de novo data -> continue to functional evidence")
+        return self.step6_functional(case, r)
+
+    # ---- STEP 6 — functional / RNA evidence --------------------------
+    def step6_functional(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        r.log("STEP 6: functional evidence (converts prediction into PS3/BS3)")
+
+        if not case.functional_assay_available:
+            r.log("No assay available")
+            r.caveats.append(
+                "PS3/BS3 not assessed. For a predicted splice variant, an RNA or minigene "
+                "assay is usually the cheapest route out of VUS."
+            )
+            return self.step7_recombine(case, r)
+
+        odds = case.functional_assay_oddspath
+        result = case.functional_assay_result
+
+        if result == "pathogenic":
+            # Brnich 2020 OddsPath scale.
+            if odds is None:
+                strength, note = Strength.SUPPORTING, "assay not OddsPath-calibrated; capped at Supporting"
+            elif odds > 18.7:
+                strength, note = Strength.STRONG, f"OddsPath {odds:.1f} > 18.7"
+            elif odds > 4.3:
+                strength, note = Strength.MODERATE, f"OddsPath {odds:.1f} > 4.3"
+            elif odds > 2.1:
+                strength, note = Strength.SUPPORTING, f"OddsPath {odds:.1f} > 2.1"
+            else:
+                r.log(f"OddsPath {odds:.1f} is below the threshold for any evidence strength")
+                return self.step7_recombine(case, r)
+            r.add("PS3", strength, "Step6", note)
+            r.log(f"Damaging assay -> PS3 {strength.label}")
+
+        elif result == "benign":
+            if odds is None:
+                strength, note = Strength.SUPPORTING, "assay not OddsPath-calibrated; capped at Supporting"
+            elif odds < 0.053:
+                strength, note = Strength.STRONG, f"OddsPath {odds:.3f} < 0.053"
+            elif odds < 0.23:
+                strength, note = Strength.MODERATE, f"OddsPath {odds:.3f} < 0.23"
+            elif odds < 0.48:
+                strength, note = Strength.SUPPORTING, f"OddsPath {odds:.3f} < 0.48"
+            else:
+                r.log(f"OddsPath {odds:.3f} is above the threshold for any benign strength")
+                return self.step7_recombine(case, r)
+            r.add("BS3", strength, "Step6", note)
+            r.log(f"Normal-function assay -> BS3 {strength.label}")
+
+        else:
+            r.log("Assay indeterminate -> no PS3/BS3")
+
+        return self.step7_recombine(case, r)
+
+    # ---- STEP 7 — recombine ------------------------------------------
+    def step7_recombine(self, case: VariantCase, r: PipelineResult) -> PipelineResult:
+        conflicts = check_mutual_exclusivity(r.evidence)
+        if conflicts:
+            r.caveats.extend(conflicts)
+
+        has_p = any(not e.is_benign and e.strength in (Strength.VERY_STRONG, Strength.STRONG)
+                    for e in r.evidence)
+        has_b = any(e.is_benign and e.strength in (Strength.VERY_STRONG, Strength.STRONG)
+                    for e in r.evidence)
+        if has_p and has_b:
+            r.log("Strong evidence on both sides -> genuine conflict, reported as VUS")
+            r.caveats.append(
+                "Conflicting strong evidence. Report as VUS with the conflict stated; "
+                "do not net the points to zero and call it VUS by default."
+            )
+            return r.finish(Classification.VUS, "Conflicting evidence",
+                            "Adjudicate the conflicting lines before re-scoring")
+
+        total = r.total_points or 0
+        r.log(f"STEP 7: Tavtigian points total = {total:+d}")
+        cls = classify_from_points(total)
+
+        if cls in (Classification.PATHOGENIC, Classification.LIKELY_PATHOGENIC):
+            if not case.gene_validity.supports_classification:
+                r.log("Gene validity below Moderate -> capped at VUS despite the point total")
+                return r.finish(Classification.VUS, "Capped (gene validity)",
+                                "Park pending ClinGen gene-disease re-curation")
+            caveat = "" if cls is Classification.PATHOGENIC else " (state the genotype-completeness caveat)"
+            return r.finish(cls, "Solved / upgraded", f"Report{caveat}")
+
+        if cls in (Classification.BENIGN, Classification.LIKELY_BENIGN):
+            return r.finish(cls, "Downgraded", "Remove from the candidate list")
+
+        return self.step8_scheduled_reanalysis(case, r, from_step="Step7")
+
+    # ---- STEP 8 — scheduled reanalysis -------------------------------
+    def step8_scheduled_reanalysis(self, case: VariantCase, r: PipelineResult,
+                                   from_step: str) -> PipelineResult:
+        r.log(f"STEP 8: still VUS at {from_step} -> scheduled reanalysis queue")
+        if case.months_since_last_run >= 12:
+            r.log("12 months elapsed -> re-running from Step 1")
+            fresh = VariantCase(**{**case.__dict__, "months_since_last_run": 0})
+            return self.step1_reannotate(fresh, r)
+        remaining = max(0, 12 - case.months_since_last_run)
+        return r.finish(Classification.VUS, "Parked (scheduled reanalysis)",
+                        f"Re-run from Step 1 in {remaining} month(s), or sooner on a "
+                        "ClinVar, gnomAD or ClinGen update")
+
+
+# =====================================================================
+# 7. Annotation retrieval
+# =====================================================================
+
+ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+MYVARIANT_URL_TMPL = "https://myvariant.info/v1/variant/{hgvs}"
+
+MYVARIANT_FIELDS = (
+    "dbnsfp,dbsnp,clinvar,gnomad_exome,gnomad_genome,exac,cadd,dbscsnv,vcf"
+)
+
+
+def build_genomic_hgvs(chrom: str, pos: str, ref: str, alt: str) -> str:
+    """('3', '97784972', 'T', 'C') -> 'chr3:g.97784972T>C'."""
+    c = str(chrom).strip().lower().replace("chr", "")
+    return f"chr{c}:g.{str(pos).strip()}{str(ref).strip().upper()}>{str(alt).strip().upper()}"
+
+
+def _get_json(url: str, params: dict, timeout: int = 20, retries: int = 3) -> Any:
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, headers={"Accept": "application/json"},
+                                timeout=timeout)
+            if resp.status_code == 404:
+                return {"_http_404": True}
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:                     # noqa: BLE001
+            last_err = exc
+            if attempt < retries - 1:
+                time.sleep(1 + attempt)
+    raise last_err if last_err else RuntimeError("request failed")
+
+
+def query_myvariant(chrom: str, pos: str, ref: str, alt: str,
+                    assembly: str = "hg38", timeout: int = 20) -> dict:
+    hgvs = build_genomic_hgvs(chrom, pos, ref, alt)
+    params = {"fields": MYVARIANT_FIELDS}
+    if assembly:
+        params["assembly"] = assembly
+    try:
+        data = _get_json(MYVARIANT_URL_TMPL.format(hgvs=hgvs), params, timeout=timeout)
+    except Exception as exc:                          # noqa: BLE001
+        return {"error": str(exc), "hgvs": hgvs}
+
+    if isinstance(data, dict) and data.get("_http_404"):
+        return {"error": f"No annotation record for {hgvs}.", "hgvs": hgvs}
+    if isinstance(data, dict) and data.get("success") is False:
+        return {"error": data.get("error", "No annotation returned."), "hgvs": hgvs}
+
+    data["_hgvs"] = hgvs
+    return data
+
+
+# --- ClinVar -----------------------------------------------------------
+
+import re as _re
+
+_C_NOTATION = _re.compile(r":(c\.[^\s(]+)")
+
+
+def extract_c_notation(title: str) -> str:
+    match = _C_NOTATION.search(title or "")
+    return match.group(1).strip() if match else ""
+
+
+def query_clinvar(gene: str, variant: str, retries: int = 3) -> list[dict]:
+    term = f'{gene}[gene] AND "{variant}"[Variant name]'
+    params = {"db": "clinvar", "term": term, "retmode": "json", "retmax": 20}
+
+    payload = _get_json(ESEARCH_URL, params, retries=retries)
+    ids = (payload or {}).get("esearchresult", {}).get("idlist", [])
+
+    if not ids:
+        params["term"] = f"{gene}[gene] AND {variant}"
+        payload = _get_json(ESEARCH_URL, params, retries=retries)
+        ids = (payload or {}).get("esearchresult", {}).get("idlist", [])
+
+    if not ids:
+        return []
+
+    summary = _get_json(ESUMMARY_URL, {"db": "clinvar", "id": ",".join(ids), "retmode": "json"},
+                        retries=retries)
+    result = (summary or {}).get("result", {})
+
+    wanted = variant.strip().lower()
+    records = []
+    for uid in ids:
+        rec = result.get(uid)
+        if not rec:
+            continue
+        title = rec.get("title", "")
+        if extract_c_notation(title).lower() != wanted:
+            continue
+        germline = rec.get("germline_classification", {}) or {}
+        raw_date = germline.get("last_evaluated", "") or ""
+        records.append({
+            "accession": rec.get("accession", uid),
+            "title": title,
+            "classification": germline.get("description", "Not provided"),
+            "review_status": germline.get("review_status", ""),
+            "last_evaluated": raw_date.split(" ")[0] if raw_date else "",
+            "link": f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{uid}/",
+        })
+    return records
+
+
+# =====================================================================
+# 8. Annotation parsing
+# =====================================================================
+
+def _first_present(d: dict, *paths: str, default: Any = None) -> Any:
+    for path in paths:
+        node: Any = d
+        ok = True
+        for key in path.split("."):
+            if isinstance(node, list):
+                node = node[0] if node else None
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+            else:
+                ok = False
+                break
+        if ok and node is not None:
+            return node
+    return default
+
+
+def _flatten(val: Any) -> list[Any]:
+    if val is None:
+        return []
+    if not isinstance(val, list):
+        return [val]
+    out: list[Any] = []
+    for v in val:
+        out.extend(_flatten(v))
+    return out
+
+
+def _worst_score(val: Any, higher_is_more_damaging: bool = True) -> Optional[float]:
+    nums = []
+    for v in _flatten(val):
+        try:
+            nums.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if not nums:
+        return None
+    return max(nums) if higher_is_more_damaging else min(nums)
+
+
+def _worst_pred(val: Any, severity_rank: list[str]) -> Optional[str]:
+    codes = {str(v) for v in _flatten(val)}
+    if not codes:
+        return None
+    for code in severity_rank:
+        if code in codes:
+            return code
+    return next(iter(codes))
+
+
+POLYPHEN2_LABELS = {"D": "Probably damaging", "P": "Possibly damaging", "B": "Benign"}
+POLYPHEN2_RANK = ["D", "P", "B"]
+SIFT_LABELS = {"D": "Deleterious", "T": "Tolerated"}
+SIFT_RANK = ["D", "T"]
+MUTATIONTASTER_LABELS = {
+    "A": "Disease causing (high confidence)",
+    "D": "Disease causing",
+    "N": "Polymorphism (benign)",
+    "P": "Polymorphism (high confidence benign)",
+}
+MUTATIONTASTER_RANK = ["A", "D", "N", "P"]
+
+TRUNCATING_EFFECTS = {
+    "stop_gained", "stop gained", "frameshift_variant", "frameshift variant",
+    "splice_donor_variant", "splice donor variant",
+    "splice_acceptor_variant", "splice acceptor variant",
+    "start_lost", "start lost", "initiator_codon_variant",
+}
+INFRAME_EFFECTS = {
+    "inframe_deletion", "inframe deletion", "inframe_insertion", "inframe insertion",
+    "stop_lost", "stop lost", "nonframeshift deletion", "nonframeshift insertion",
+}
+MISSENSE_EFFECTS = {"missense_variant", "missense variant", "nonsynonymous snv"}
+SYNONYMOUS_EFFECTS = {"synonymous_variant", "synonymous variant", "synonymous snv"}
+SPLICE_REGION_EFFECTS = {"splice_region_variant", "splice region variant"}
+INTRONIC_EFFECTS = {
+    "intron_variant", "intron variant", "intronic",
+    "5_prime_utr_variant", "3_prime_utr_variant",
+}
+
+
+def parse_molecular_class(annotation: dict) -> MolecularClass:
+    """Map the annotated consequence onto a MolecularClass.
+
+    FIX — the previous version listed ``dbnsfp.genename`` as a fallback path for
+    the consequence string, then had to re-derive the value on the next line.
+    The dead path is gone and the consequence list is searched properly.
+    """
+    raw = _first_present(
+        annotation,
+        "dbnsfp.ensembl.consequence",
+        "dbnsfp.vep.consequence",
+        "cadd.consequence",
+        default=None,
+    )
+    effects = {str(e).strip().lower() for e in _flatten(raw)}
+    if not effects:
+        return MolecularClass.OTHER
+    if effects & TRUNCATING_EFFECTS:
+        return MolecularClass.TRUNCATING
+    if effects & INFRAME_EFFECTS:
+        return MolecularClass.INFRAME_INDEL
+    if effects & MISSENSE_EFFECTS:
+        return MolecularClass.MISSENSE
+    if effects & SYNONYMOUS_EFFECTS:
+        return MolecularClass.SYNONYMOUS
+    if effects & SPLICE_REGION_EFFECTS:
+        return MolecularClass.SPLICE_REGION
+    if effects & INTRONIC_EFFECTS:
+        return MolecularClass.INTRONIC_OR_UTR
+    return MolecularClass.OTHER
+
+
+def parse_frequency(annotation: dict) -> FrequencyEvidence:
+    """Build FrequencyEvidence, distinguishing absent from uncalled."""
+    faf = _worst_score(_first_present(
+        annotation,
+        "gnomad_exome.faf95.faf95_popmax", "gnomad_genome.faf95.faf95_popmax",
+        "gnomad_exome.faf95_popmax", "gnomad_genome.faf95_popmax",
+    ))
+
+    popmax = _worst_score(_first_present(
+        annotation,
+        "dbnsfp.gnomad4.1_joint.af_popmax",
+        "dbnsfp.gnomad.af_popmax",
+        "dbnsfp.gnomad4.af_popmax_joint",
+    ))
+
+    allele_number = 0
+    hom = 0
+    hemi = 0
+    sources: list[str] = []
+    per_pop: list[float] = []
+
+    for src in ("gnomad_exome", "gnomad_genome"):
+        block = annotation.get(src) or {}
+        if not isinstance(block, dict) or not block:
+            continue
+        sources.append(src)
+
+        af_block = block.get("af")
+        if isinstance(af_block, dict):
+            for key, val in af_block.items():
+                if key.startswith("af_") and isinstance(val, (int, float)):
+                    per_pop.append(float(val))
+            if isinstance(af_block.get("af"), (int, float)):
+                per_pop.append(float(af_block["af"]))
+        elif isinstance(af_block, (int, float)):
+            per_pop.append(float(af_block))
+
+        an_block = block.get("an")
+        if isinstance(an_block, dict):
+            an_val = an_block.get("an")
+            if isinstance(an_val, (int, float)):
+                allele_number = max(allele_number, int(an_val))
+        elif isinstance(an_block, (int, float)):
+            allele_number = max(allele_number, int(an_block))
+
+        hom_block = block.get("hom")
+        if isinstance(hom_block, dict):
+            hom += sum(int(v) for v in hom_block.values() if isinstance(v, (int, float)))
+        elif isinstance(hom_block, (int, float)):
+            hom += int(hom_block)
+
+        hemi_block = block.get("hemi")
+        if isinstance(hemi_block, dict):
+            hemi += sum(int(v) for v in hemi_block.values() if isinstance(v, (int, float)))
+        elif isinstance(hemi_block, (int, float)):
+            hemi += int(hemi_block)
+
+    if popmax is None and per_pop:
+        popmax = max(per_pop)
+
+    # popmax stays None when nothing gnomAD-shaped came back: absent from the
+    # API is not absent from the population.
+    if popmax is None and not sources:
+        return FrequencyEvidence(source="none")
+
+    return FrequencyEvidence(
+        popmax_af=popmax if popmax is not None else 0.0,
+        faf95=faf,
+        allele_number=allele_number,
+        hom_count=hom,
+        hemi_count=hemi,
+        source="+".join(sources) or "dbnsfp",
+    )
+
+
+def parse_insilico(annotation: dict) -> InSilicoEvidence:
+    pp2_score = _worst_score(_first_present(
+        annotation,
+        "dbnsfp.polyphen2.hdiv.score", "dbnsfp.polyphen2_hdiv_score",
+        "dbnsfp.polyphen2.hvar.score", "dbnsfp.polyphen2_hvar_score",
+    ))
+    pp2_code = _worst_pred(_first_present(
+        annotation,
+        "dbnsfp.polyphen2.hdiv.pred", "dbnsfp.polyphen2_hdiv_pred",
+        "dbnsfp.polyphen2.hvar.pred", "dbnsfp.polyphen2_hvar_pred",
+    ), POLYPHEN2_RANK)
+
+    sift_score = _worst_score(
+        _first_present(annotation, "dbnsfp.sift.score", "dbnsfp.sift_score"),
+        higher_is_more_damaging=False,
+    )
+    sift_code = _worst_pred(
+        _first_present(annotation, "dbnsfp.sift.pred", "dbnsfp.sift_pred"), SIFT_RANK)
+
+    mt_score = _worst_score(_first_present(
+        annotation, "dbnsfp.mutationtaster.score", "dbnsfp.mutationtaster_score"))
+    mt_code = _worst_pred(_first_present(
+        annotation, "dbnsfp.mutationtaster.pred", "dbnsfp.mutationtaster_pred"),
+        MUTATIONTASTER_RANK)
+
+    ada = _first_present(annotation, "dbscsnv.ada_score", "dbnsfp.dbscsnv.ada_score")
+    rf = _first_present(annotation, "dbscsnv.rf_score", "dbnsfp.dbscsnv.rf_score")
+    dbscsnv_vals = [v for v in (_worst_score(ada), _worst_score(rf)) if v is not None]
+
+    return InSilicoEvidence(
+        revel=_worst_score(_first_present(annotation, "dbnsfp.revel.score", "dbnsfp.revel_score")),
+        alphamissense=_worst_score(_first_present(
+            annotation, "dbnsfp.alphamissense.score", "dbnsfp.alphamissense_score")),
+        spliceai=None if False else _worst_score(_first_present(
+            annotation, "dbnsfp.spliceai.ds_max", "spliceai.ds_max")),
+        dbscsnv_max=max(dbscsnv_vals) if dbscsnv_vals else None,
+        phylop=_worst_score(_first_present(
+            annotation, "dbnsfp.phylo_p100way_vertebrate.score",
+            "dbnsfp.phylop100way_vertebrate", "dbnsfp.phylop_100way_vertebrate")),
+        gerp=_worst_score(_first_present(
+            annotation, "dbnsfp.gerp++.rs", "dbnsfp.gerp++_rs", "dbnsfp.gerp_rs")),
+        cadd_phred=_worst_score(_first_present(
+            annotation, "cadd.phred", "dbnsfp.cadd.phred", "dbnsfp.cadd_phred")),
+        polyphen2=(pp2_score, pp2_code, POLYPHEN2_LABELS.get(pp2_code or "", pp2_code)),
+        sift=(sift_score, sift_code, SIFT_LABELS.get(sift_code or "", sift_code)),
+        mutationtaster=(mt_score, mt_code, MUTATIONTASTER_LABELS.get(mt_code or "", mt_code)),
+    )
+
+
+def parse_annotation(annotation: dict) -> dict:
+    """One call that turns a MyVariant payload into the core's input objects."""
+    gene = _first_present(annotation, "dbnsfp.genename", default="")
+    if isinstance(gene, list):
+        gene = gene[0] if gene else ""
+
+    clinvar = annotation.get("clinvar") or {}
+    rcv = clinvar.get("rcv")
+    if isinstance(rcv, dict):
+        rcv = [rcv]
+
+    return {
+        "gene": gene,
+        "molecular_class": parse_molecular_class(annotation),
+        "frequency": parse_frequency(annotation),
+        "insilico": parse_insilico(annotation),
+        "rsid": _first_present(annotation, "dbsnp.rsid"),
+        "clinvar_variant_id": clinvar.get("variant_id"),
+        "clinvar_accessions": [
+            r.get("accession") for r in (rcv or []) if isinstance(r, dict) and r.get("accession")
+        ],
+        "thousand_genomes_af": _worst_score(_first_present(
+            annotation, "dbnsfp.1000gp3.af", "dbnsfp.1000gp3.gaf", "dbnsfp.1000gp3_af")),
+        "exac_af": _worst_score(_first_present(
+            annotation, "exac.af.af", "exac.af", "dbnsfp.exac.af", "dbnsfp.exac_af")),
+    }
+
+
+# =====================================================================
+# 9. Display metadata
+# =====================================================================
+
+ACMG_CRITERIA_DESCRIPTIONS = {
+    "PVS1": "Null variant in a gene where loss of function is a known disease mechanism",
+    "PS1": "Same amino-acid change as an established pathogenic variant",
+    "PS2": "Confirmed de novo in a patient with the disease and no family history",
+    "PS3": "Well-established functional studies show a damaging effect",
+    "PS4": "Prevalence in affected individuals significantly exceeds controls",
+    "PM1": "Located in a mutational hot spot or critical functional domain",
+    "PM2": "Absent, or at extremely low frequency, in population databases",
+    "PM3": "In trans with a pathogenic variant (recessive disorders)",
+    "PM4": "Protein length change from an in-frame indel or stop-loss",
+    "PM5": "Novel missense change at a residue with a known pathogenic missense change",
+    "PM6": "Assumed de novo without confirmed parentage",
+    "PP1": "Cosegregates with disease in multiple affected family members",
+    "PP2": "Missense variant in a gene with a low rate of benign missense variation",
+    "PP3": "Computational evidence supports a deleterious effect",
+    "PP4": "Phenotype highly specific for a disease with a single genetic aetiology",
+    "PP5": "RETIRED (ClinGen SVI 2018) — reputable source reports pathogenic",
+    "BA1": "Allele frequency too high to be causal (stand-alone benign)",
+    "BS1": "Allele frequency greater than expected for the disorder",
+    "BS2": "Observed in healthy individuals for a fully penetrant condition",
+    "BS3": "Well-established functional studies show no damaging effect",
+    "BS4": "Lack of segregation in affected family members",
+    "BP1": "Missense variant in a gene where only truncating variants cause disease",
+    "BP2": "Observed in trans or in cis with a pathogenic variant",
+    "BP3": "In-frame indel in a repetitive region without known function",
+    "BP4": "Computational evidence suggests no impact",
+    "BP5": "Found in a case with an alternate molecular basis for disease",
+    "BP6": "RETIRED (ClinGen SVI 2018) — reputable source reports benign",
+    "BP7": "Synonymous variant, no predicted splice impact, nucleotide not conserved",
+}
+
+ACMG_CRITERIA_BASIS = {
+    "PVS1": "predicted loss of function (AutoPVS1 / NMD decision tree)",
+    "PS1": "residue-level ClinVar lookup",
+    "PS2": "confirmed de novo occurrence",
+    "PS3": "OddsPath-calibrated functional assay",
+    "PS4": "case/control prevalence or proband counting",
+    "PM1": "domain and hot-spot curation (UniProt, InterPro, MetaDome)",
+    "PM2": "gnomAD frequency with coverage check",
+    "PM3": "confirmed trans phase with a pathogenic allele",
+    "PM4": "protein length change outside a repeat region",
+    "PM5": "residue-level ClinVar lookup",
+    "PM6": "assumed de novo occurrence",
+    "PP1": "pedigree segregation (LOD / informative meioses)",
+    "PP2": "gene-level missense constraint",
+    "PP3": "one calibrated predictor (REVEL, AlphaMissense or SpliceAI)",
+    "PP4": "phenotype specificity (HPO)",
+    "BA1": "gnomAD filtering allele frequency",
+    "BS1": "gnomAD FAF against the disease's max credible AF",
+    "BS2": "gnomAD homozygote / hemizygote counts",
+    "BS3": "OddsPath-calibrated functional assay",
+    "BS4": "pedigree segregation",
+    "BP1": "gene mechanism (truncating-only gene)",
+    "BP2": "confirmed phase with a pathogenic variant",
+    "BP3": "repeat-region annotation (RepeatMasker, UniProt)",
+    "BP4": "one calibrated predictor",
+    "BP5": "alternate molecular diagnosis in the case",
+    "BP7": "splice predictor plus nucleotide conservation",
+}
