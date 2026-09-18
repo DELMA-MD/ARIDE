@@ -190,25 +190,21 @@ def render_reclass_slide():
 
     with st.form("variant_form"):
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             gene_symbol = st.text_input("Gene symbol", value=prior.get("gene", ""), placeholder="ARL6")
         with col2:
             transcript_id = st.text_input("Transcript ID", placeholder="NM_177976.3")
-
-        col3, col4 = st.columns(2)
         with col3:
             chromosome = st.text_input("Chromosome", placeholder="3")
         with col4:
             position = st.text_input("Position (GRCh38)", placeholder="97784972")
 
-        col5, col6 = st.columns(2)
+        col5, col6, col7, col8 = st.columns(4)
         with col5:
             ref_allele = st.text_input("Reference allele", placeholder="T")
         with col6:
             alt_allele = st.text_input("Alternate allele", placeholder="C")
-
-        col7, col8 = st.columns(2)
         with col7:
             hgvs_c = st.text_input("HGVS coding (c.)", value=prior.get("variant", ""), placeholder="c.272T>C")
         with col8:
@@ -666,15 +662,6 @@ class VUSResolutionPipeline:
                          f"Re-run from Step 1 in {max(0, 12 - case.months_since_last_run)} month(s), "
                          "or sooner if ClinVar/gnomAD/ClinGen updates")
 
-
-# =====================================================================
-# STEP 4a (NEW) — Shared ACMG criteria table helpers
-#
-# Both the automated annotation-based call and the pipeline's evidence
-# trail are displayed as a table: criterion code, plain-language
-# description, strength/points, with a total-points row at the end.
-# =====================================================================
-
 ACMG_CRITERIA_DESCRIPTIONS = {
     "PVS1": "Null variant in a gene where loss-of-function is a known disease mechanism",
     "PS1": "Same amino-acid change as an established pathogenic variant",
@@ -713,28 +700,28 @@ ACMG_CRITERIA_BASIS = {
     "PS3": "functional assay",
     "PS4": "case/control prevalence",
     "PM1": "mutational hot-spot / functional domain location",
-    "PM2": "population frequency (gnomAD via dbNSFP)",
+    "PM2": "population frequency (gnomAD)",
     "PM3": "phase (trans) with a known pathogenic variant",
     "PM4": "protein length change",
     "PM5": "known pathogenic missense change at the same residue",
     "PM6": "assumed (unconfirmed) de novo occurrence",
     "PP1": "family segregation analysis",
     "PP2": "gene-level missense constraint",
-    "PP3": "in-silico predictors (REVEL / AlphaMissense / CADD, via dbNSFP)",
+    "PP3": "in-silico predictors (REVEL / AlphaMissense / CADD)",
     "PP4": "phenotype specificity",
     "PP5": "reputable source (e.g. ClinVar) report",
-    "BA1": "population frequency (gnomAD via dbNSFP)",
-    "BS1": "population frequency (gnomAD via dbNSFP)",
-    "BS2": "gnomAD homozygote count in unaffected individuals (via dbNSFP)",
+    "BA1": "population frequency (gnomAD)",
+    "BS1": "population frequency (gnomAD)",
+    "BS2": "gnomAD homozygote count in unaffected individuals (gnomAD)",
     "BS3": "functional assay",
     "BS4": "family segregation analysis",
     "BP1": "gene-level mechanism (truncating-only gene)",
     "BP2": "phase (trans/cis) with a known pathogenic variant",
     "BP3": "repetitive region location",
-    "BP4": "in-silico predictors (REVEL / AlphaMissense / CADD, via dbNSFP)",
+    "BP4": "in-silico predictors (REVEL / AlphaMissense / CADD)",
     "BP5": "alternate molecular diagnosis in the case",
     "BP6": "reputable source (e.g. ClinVar) report",
-    "BP7": "splice-impact predictor (dbscSNV ADA/RF, via dbNSFP)",
+    "BP7": "splice-impact predictor (dbscSNV ADA/RF)",
 }
 
 STRENGTH_POINTS = {"VeryStrong": 8, "Strong": 4, "Moderate": 2, "Supporting": 1}
@@ -783,34 +770,6 @@ def pipeline_evidence_table(result: "PipelineResult"):
     return rows, total_display
 
 
-# =====================================================================
-# STEP 5 (REPLACED) — dbNSFP annotation, via MyVariant.info
-#
-# The dbNSFP project's own public browser (https://query.dbnsfp.org) has
-# no documented/public REST API — it's a single-page app, its backend
-# route disallows automated fetching (robots.txt), and it isn't on this
-# environment's outbound network allowlist either. MyVariant.info is
-# used instead: it's a stable, documented, free, no-auth REST API that
-# aggregates and re-publishes the SAME dbNSFP release (functional
-# predictors, conservation scores, gnomAD-derived frequencies) alongside
-# dbSNP and ClinVar for the same variant, indexed on both hg19 and hg38.
-# Reference: https://docs.myvariant.info/
-#
-# IMPORTANT — this integration could not be exercised against a live
-# response in this environment (myvariant.info is also outside the
-# sandbox's outbound allowlist), so field paths below are taken from
-# MyVariant.info's published schema/docs rather than a verified live
-# call. The raw JSON is always shown in an expander in the UI below so
-# you can check/adjust field names quickly against what actually comes
-# back the first time you run this.
-#
-# Like the previous annotation source, this only ever receives a bare
-# chr-pos-ref-alt, so it can supply exactly the Step-1/Step-2/Step-3
-# evidence (population frequency, REVEL, AlphaMissense, CADD, splice
-# predictors) — never zygosity, phasing, family or functional-assay
-# data, which are collected from the user separately.
-# =====================================================================
-
 MYVARIANT_URL_TMPL = "https://myvariant.info/v1/variant/{hgvs}"
 MYVARIANT_FIELDS = (
     "dbnsfp,dbsnp,clinvar,gnomad_exome,gnomad_genome,exac,"
@@ -837,10 +796,6 @@ def build_genomic_hgvs(chrom: str, pos: str, ref: str, alt: str) -> str:
 
 
 def _first_present(d: dict, *paths, default=None):
-    """Walks a list of dotted paths (e.g. 'dbnsfp.gnomad4.af_total') against
-    nested dict d and returns the first non-None value found. Defensive
-    helper since exact field names/nesting can shift between dbNSFP/
-    MyVariant.info releases — see module docstring above."""
     for path in paths:
         node = d
         ok = True
@@ -858,10 +813,6 @@ def _first_present(d: dict, *paths, default=None):
 
 
 def _flatten_values(val):
-    """dbNSFP predictor scores/predictions are reported per-transcript,
-    so MyVariant.info often returns a list (sometimes nested) instead of
-    a single value when a variant maps to multiple transcripts. Flattens
-    that into a clean list, dropping Nones."""
     if val is None:
         return []
     if not isinstance(val, list):
@@ -873,11 +824,6 @@ def _flatten_values(val):
 
 
 def _worst_case_score(val, higher_is_more_damaging: bool = True) -> Optional[float]:
-    """Reduces a scalar-or-list dbNSFP score to one float, taking the
-    worst-case (most damaging) value across transcripts when there are
-    several \u2014 the standard convention for these predictors. Pass
-    higher_is_more_damaging=False for SIFT, which is inverted (lower
-    score = more damaging)."""
     nums = []
     for v in _flatten_values(val):
         try:
@@ -890,9 +836,6 @@ def _worst_case_score(val, higher_is_more_damaging: bool = True) -> Optional[flo
 
 
 def _worst_case_pred(val, severity_rank: list) -> Optional[str]:
-    """Reduces a scalar-or-list dbNSFP prediction letter code to a
-    single code, preferring whichever entry in severity_rank (ordered
-    most- to least-damaging) is present across transcripts."""
     codes = {str(v) for v in _flatten_values(val)}
     if not codes:
         return None
@@ -934,16 +877,6 @@ def _fmt_text(value) -> str:
 
 
 def _fmt_predictor_grid_entry(score, code, label, decimals: int = 3):
-    """Builds the (value, caption) pair for a predictor that carries
-    both a numeric score and a code/label pair, following this order
-    of preference:
-      1. Score available          -> score is the value; 'CODE \u2014 Label'
-                                      is the caption underneath.
-      2. Score missing, code/label
-         available                -> 'CODE \u2014 Label' becomes the value
-                                      itself (no separate caption).
-      3. Neither available        -> value is '-'.
-    """
     if code and label and code != label:
         code_label = f"{code} \u2014 {label}"
     else:
@@ -957,9 +890,6 @@ def _fmt_predictor_grid_entry(score, code, label, decimals: int = 3):
 
 
 def query_dbnsfp(chrom: str, pos: str, ref: str, alt: str, genome: str = "hg38", timeout: int = 20):
-    """Single-variant lookup against MyVariant.info (mirrors dbNSFP +
-    dbSNP + ClinVar + gnomAD for the same variant). Returns the
-    annotation dict, or a dict with an 'error' key on failure / no hit."""
     hgvs = build_genomic_hgvs(chrom, pos, ref, alt)
     params = {"fields": MYVARIANT_FIELDS}
     if genome == "hg38":
@@ -971,7 +901,7 @@ def query_dbnsfp(chrom: str, pos: str, ref: str, alt: str, genome: str = "hg38",
         return {"error": str(e), "hgvs": hgvs}
 
     if r.status_code == 404:
-        return {"error": f"No dbNSFP/MyVariant.info record found for {hgvs}.", "hgvs": hgvs}
+        return {"error": f"No record found for {hgvs}.", "hgvs": hgvs}
     try:
         r.raise_for_status()
         data = r.json()
@@ -986,9 +916,6 @@ def query_dbnsfp(chrom: str, pos: str, ref: str, alt: str, genome: str = "hg38",
 
 
 def dbnsfp_popmax_af(annotation: dict) -> float:
-    """Best-effort popmax allele frequency: prefers an explicit dbNSFP
-    popmax field, falls back to the max across gnomAD exome/genome
-    population subsets MyVariant.info exposes."""
     explicit = _first_present(
         annotation,
         "dbnsfp.gnomad4.1_joint.af_popmax",
@@ -1069,9 +996,6 @@ def dbnsfp_cadd_phred(annotation: dict) -> Optional[float]:
 
 
 def dbnsfp_1000g_af(annotation: dict) -> Optional[float]:
-    """1000 Genomes Project Phase 3 global allele frequency (via dbNSFP).
-    Field name starts with a digit in dbNSFP's own schema ('1000Gp3'),
-    so MyVariant.info exposes it as the string key '1000gp3'."""
     val = _first_present(
         annotation,
         "dbnsfp.1000gp3.af",
@@ -1082,12 +1006,6 @@ def dbnsfp_1000g_af(annotation: dict) -> Optional[float]:
 
 
 def dbnsfp_exac_af(annotation: dict) -> Optional[float]:
-    """ExAC allele frequency \u2014 prefers MyVariant.info's dedicated
-    'exac' data source block (same af.af shape as gnomad_exome/
-    gnomad_genome), falls back to the copy dbNSFP itself carries.
-    Note: ExAC is superseded by gnomAD (which absorbed the ExAC
-    samples) \u2014 shown here for reference/cross-checking only, not
-    used in BA1/BS1/PM2 below."""
     af_block = (annotation.get("exac") or {}).get("af") or {}
     if isinstance(af_block, dict) and isinstance(af_block.get("af"), (int, float)):
         return float(af_block["af"])
@@ -1096,10 +1014,6 @@ def dbnsfp_exac_af(annotation: dict) -> Optional[float]:
 
 
 def dbnsfp_polyphen2_score(annotation: dict):
-    """Returns (score, code, label). Prefers PolyPhen2 HDIV (the variant
-    ACMG/AMP guidance historically referenced), falls back to HVAR.
-    Multiple transcripts are reduced to the single worst-case (most
-    damaging) score and prediction."""
     score = _first_present(
         annotation,
         "dbnsfp.polyphen2.hdiv.score", "dbnsfp.polyphen2_hdiv_score",
@@ -1116,10 +1030,6 @@ def dbnsfp_polyphen2_score(annotation: dict):
 
 
 def dbnsfp_sift_score(annotation: dict):
-    """Returns (score, code, label). Unlike most predictors here, SIFT
-    is inverted \u2014 LOWER means more damaging (conventionally <=0.05
-    is 'deleterious'), so the worst-case score is the MINIMUM across
-    transcripts, not the maximum."""
     score = _first_present(annotation, "dbnsfp.sift.score", "dbnsfp.sift_score")
     pred = _first_present(annotation, "dbnsfp.sift.pred", "dbnsfp.sift_pred")
     code = _worst_case_pred(pred, SIFT_RANK)
@@ -1128,9 +1038,6 @@ def dbnsfp_sift_score(annotation: dict):
 
 
 def dbnsfp_mutationtaster_score(annotation: dict):
-    """Returns (score, code, label). MutationTaster's own prediction
-    codes (A/D/N/P) aren't self-explanatory on their own, so the label
-    spells them out \u2014 e.g. code 'N', label 'Polymorphism (benign)'."""
     score = _first_present(annotation, "dbnsfp.mutationtaster.score", "dbnsfp.mutationtaster_score")
     pred = _first_present(annotation, "dbnsfp.mutationtaster.pred", "dbnsfp.mutationtaster_pred")
     code = _worst_case_pred(pred, MUTATIONTASTER_RANK)
@@ -1139,10 +1046,6 @@ def dbnsfp_mutationtaster_score(annotation: dict):
 
 
 def dbnsfp_splice_score(annotation: dict) -> Optional[float]:
-    """dbNSFP itself doesn't carry SpliceAI (it's an nsSNV/ssSNV
-    predictor database, not a splicing-specific one); dbscSNV's ADA/RF
-    ensemble scores are the closest 0-1 splice-impact proxy it ships,
-    used here as a stand-in for the pipeline's SpliceAI-delta slot."""
     ada = _first_present(annotation, "dbscsnv.ada_score", "dbnsfp.dbscsnv.ada_score")
     rf = _first_present(annotation, "dbscsnv.rf_score", "dbnsfp.dbscsnv.rf_score")
     vals = [v for v in (ada, rf) if isinstance(v, (int, float))]
@@ -1154,9 +1057,6 @@ def dbnsfp_rsid(annotation: dict) -> Optional[str]:
 
 
 def dbnsfp_clinvar_ids(annotation: dict):
-    """Returns (variant_id, list_of_rcv_accessions) — MyVariant.info's
-    ClinVar block. variant_id is what NCBI's /clinvar/variation/<id>/
-    permalink expects."""
     clinvar = annotation.get("clinvar") or {}
     variant_id = clinvar.get("variant_id")
     rcv = clinvar.get("rcv")
@@ -1224,11 +1124,6 @@ def dbnsfp_acmg_table_rows(annotation: dict, case_kwargs: dict):
         })
     return table
 
-
-# =====================================================================
-# STEP 6 (REPLACED) — UI: dbNSFP (via MyVariant.info) annotation
-# =====================================================================
-
 def render_compact_metric_grid(items, columns: int = 6):
 
     for start in range(0, len(items), columns):
@@ -1264,8 +1159,6 @@ def render_dbnsfp_case_section():
     )
     target = variants[selected_idx]
 
-    # Fetch automatically as soon as a variant is selected — re-fetches only
-    # when the selected variant actually changes, not on every rerun.
     cache_key = f"{target['chromosome']}:{target['position']}:{target['ref_allele']}:{target['alt_allele']}"
     if st.session_state.get("dbnsfp_cache_key") != cache_key:
         with st.spinner("Fetching annotation scores..."):
@@ -1329,7 +1222,7 @@ def render_dbnsfp_case_section():
     if splice_val is not None:
         st.caption(
             f"Splice-impact proxy (dbscSNV ADA/RF max, standing in for SpliceAI \u2014 "
-            f"dbNSFP does not itself carry SpliceAI): {splice_val:.3f}"
+            f"{splice_val:.3f}"
         )
 
     rows = dbnsfp_acmg_table_rows(annotation, case_kwargs)
